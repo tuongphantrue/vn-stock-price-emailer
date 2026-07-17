@@ -27,6 +27,7 @@ jobs:
         env:
           WATCHLIST: ${{ vars.WATCHLIST }}
           ALERT_THRESHOLD_PERCENT: ${{ vars.ALERT_THRESHOLD_PERCENT }}
+          DEBUG_EMPTY_RESPONSES: ${{ vars.DEBUG_EMPTY_RESPONSES }}
         run: python vn_stock_price_emailer.py generate
 
       - name: Send email
