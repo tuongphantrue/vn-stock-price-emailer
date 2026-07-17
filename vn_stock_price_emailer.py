@@ -2,34 +2,40 @@
 vn_stock_price_emailer.py
 
 Fetches prices for a watchlist of Vietnam-listed stocks (HOSE/HNX/UPCOM),
-plus the major indices (VN-Index, HNX-Index, UPCOM-Index), from VNDirect's
-public quotes feed, and emails a daily summary. Designed to run on GitHub
-Actions (see .github/workflows/send-stock-price.yml) or locally via cron.
-No local computer needs to stay on.
+plus the major indices (VN-Index, HNX-Index, UPCOM-Index), and emails a
+daily summary. Designed to run on GitHub Actions (see
+.github/workflows/send-stock-price.yml) or locally via cron. No local
+computer needs to stay on.
 
 Modeled on the same pattern as currency-rate-emailer / gold-price-emailer /
-tech-price-mailer: pulls from a public source, degrades gracefully per
-ticker if a lookup fails, tracks state/history, and emails a summary.
+tech-price-mailer: pulls from public sources, degrades gracefully if one
+fails, tracks state/history, and emails a summary.
 
-Data source:
+Data sources, tried in this order per ticker (first success wins for that
+ticker; sources are independent hosts, so a block on one doesn't take out
+the others):
 
-    VNDirect public quotes feed (finfo-api.vndirect.com.vn/v4/stock_prices)
-    - the same feed a number of independent open-source VN stock tools
-      (vnquant, MiAI_Airflow, etc.) have used for years. Not a documented/
-      versioned API, so it can change shape or rate-limit without notice -
-      same caveat the Vietcombank source carries in currency-rate-emailer.
+1. CafeF (s.cafef.vn) - public AJAX endpoint behind cafef.vn's own price
+   history pages. Field names verified against several independent
+   scrapers using this exact endpoint over multiple years.
+2. FireAnt (restv2.fireant.vn) - public endpoint behind fireant.vn's own
+   site. Response field names were NOT independently verifiable while
+   writing this (no live network access in this environment) - the parser
+   tries several plausible field names and simply skips a ticker if none
+   match, so a schema mismatch degrades gracefully instead of reporting a
+   wrong number. Worth double-checking the first real email against
+   https://fireant.vn for a sanity check.
+3. VNDirect (finfo-api.vndirect.com.vn) - the original source used here.
+   Confirmed reachable and correctly-shaped in earlier testing, but times
+   out entirely from GitHub Actions runners (Azure IP ranges appear to be
+   blocked). Kept as a third attempt since it may work fine if you run
+   this from a non-cloud IP (e.g. your own machine, or a self-hosted
+   runner), and costs nothing to try last.
 
-    NOTE on history: this script originally also pulled from TCBS's public
-    feed (apipubaws.tcbs.com.vn) as a second, cross-checked source. That
-    feed now 404s on every ticker because the `vnstock` project's own
-    maintainers removed TCBS as a supported data source entirely - it's
-    not coming back. TCBS has been dropped from this script rather than
-    kept as a permanently-broken fallback. If you want a second
-    independent source back for cross-checking, VCI's (Vietcap's) public
-    feed at trading.vietcap.com.vn is the current vnstock default source
-    and would be the next one to add - it wasn't wired up here because its
-    exact endpoint/response shape couldn't be verified in this environment
-    (no live network access while writing this).
+None of these are documented/versioned APIs - they're the public JSON
+endpoints behind each site's own web app, the same category of caveat the
+Vietcombank source carries in currency-rate-emailer. Any of them can
+change shape, rate-limit, or block a given IP range without notice.
 
 Extra features (matching the sibling emailers):
 
@@ -40,6 +46,8 @@ Extra features (matching the sibling emailers):
   and emails a 7-day % change summary once a week
 - Move-threshold alerting: only send if some stock moved >= X% since the
   last run (optional)
+- Per-run footer noting which source(s) actually supplied data, so you
+  can tell at a glance if one of the three has gone dark
 
 Usage:
     python vn_stock_price_emailer.py generate   # fetch prices, build email body -> email_body.txt
@@ -102,10 +110,9 @@ INDICES = [
     ("UPCOMINDEX", "UPCOM-Index"),
 ]
 
+CAFEF_HISTORY_URL = "https://s.cafef.vn/Ajax/PageNew/DataHistory/PriceHistory.ashx"
+FIREANT_QUOTES_URL = "https://restv2.fireant.vn/stocks/{symbol}/quotes"
 VNDIRECT_QUOTES_URL = "https://finfo-api.vndirect.com.vn/v4/stock_prices"
-
-SOURCE_NAME = "VNDirect"
-SOURCE_URL = "https://dstock.vndirect.com.vn/"
 
 EMAIL_BODY_FILE = "email_body.txt"
 STATE_FILE = "last_prices.json"
@@ -122,22 +129,158 @@ SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
 
 HEADERS = {
-    # This host blocks the bare default "python-requests/x.y" User-Agent,
-    # so we look like an ordinary browser instead.
+    # Several of these hosts block the bare default "python-requests/x.y"
+    # User-Agent, so we look like an ordinary browser instead.
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     ),
     "Accept": "application/json",
 }
+REQUEST_TIMEOUT = 15
 
-# --- Fetch: VNDirect ---------------------------------------------------------
+
+def _first_present(d, keys):
+    """Returns the first non-None value found in dict d for any key in keys."""
+    if not d:
+        return None
+    for key in keys:
+        if key in d and d[key] is not None:
+            return d[key]
+    return None
+
+
+# --- Source 1: CafeF ----------------------------------------------------------
+
+
+def _fetch_cafef_history(symbol, page_size=5):
+    """Returns rows (newest first) from CafeF's price-history AJAX feed for
+    one symbol. Works for both stock tickers and index codes (VNINDEX etc.)
+    """
+    params = {
+        "Symbol": symbol,
+        "StartDate": "",
+        "EndDate": "",
+        "PageIndex": 1,
+        "PageSize": page_size,
+    }
+    resp = requests.get(CAFEF_HISTORY_URL, headers=HEADERS, params=params, timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    data = resp.json()
+    rows = ((data.get("Data") or {}).get("Data")) or []
+
+    def _row_date(row):
+        try:
+            return datetime.strptime(row.get("Ngay", ""), "%d/%m/%Y")
+        except ValueError:
+            return datetime.min
+
+    rows.sort(key=_row_date, reverse=True)
+    return rows
+
+
+def fetch_cafef_stock_prices(tickers):
+    """Returns {ticker: {"close": VND, "prev_close": VND|None, "volume": int}}.
+    CafeF quotes stock prices in thousand VND (e.g. 85.5 == 85,500 VND), so
+    we scale by 1000 to get plain VND, matching the rest of the script.
+    """
+    result = {}
+    for ticker in tickers:
+        try:
+            rows = _fetch_cafef_history(ticker)
+            if not rows:
+                continue
+            latest = rows[0]
+            prev = rows[1] if len(rows) >= 2 else None
+            close = latest.get("GiaDongCua")
+            if close is None:
+                continue
+            result[ticker] = {
+                "close": float(close) * 1000,
+                "prev_close": float(prev["GiaDongCua"]) * 1000 if prev and prev.get("GiaDongCua") else None,
+                "volume": int(latest.get("KhoiLuongKhopLenh") or 0),
+            }
+        except Exception as e:
+            print(f"CafeF fetch failed for {ticker}: {e}")
+            continue
+    return result
+
+
+def fetch_cafef_indices():
+    """Returns {index_label: {"close": pts, "prev_close": pts|None}}.
+    Index points are used as-is (no thousand-VND scaling).
+    """
+    result = {}
+    for code, label in INDICES:
+        try:
+            rows = _fetch_cafef_history(code)
+            if not rows:
+                continue
+            latest = rows[0]
+            prev = rows[1] if len(rows) >= 2 else None
+            close = latest.get("GiaDongCua")
+            if close is None:
+                continue
+            result[label] = {
+                "close": float(close),
+                "prev_close": float(prev["GiaDongCua"]) if prev and prev.get("GiaDongCua") else None,
+            }
+        except Exception as e:
+            print(f"CafeF index fetch failed for {label}: {e}")
+            continue
+    return result
+
+
+# --- Source 2: FireAnt ---------------------------------------------------------
+
+
+def fetch_fireant_stock_prices(tickers):
+    """Returns {ticker: {"close": VND, "prev_close": VND|None, "volume": int}}.
+    Best-effort: tries several plausible field names since the exact schema
+    wasn't independently verifiable while writing this. Skips a ticker
+    entirely (rather than guessing) if none of the candidate fields match.
+    """
+    result = {}
+    for ticker in tickers:
+        try:
+            url = FIREANT_QUOTES_URL.format(symbol=ticker)
+            resp = requests.get(
+                url, headers=HEADERS, params={"offset": 0, "limit": 5}, timeout=REQUEST_TIMEOUT
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            rows = data if isinstance(data, list) else (data.get("data") or [])
+            if not rows:
+                continue
+            latest = rows[0]
+            prev = rows[1] if len(rows) >= 2 else None
+
+            close = _first_present(latest, ["PriceLast", "PriceClose", "priceClose", "ClosePrice", "close"])
+            if close is None:
+                continue
+            prev_close = _first_present(
+                prev, ["PriceLast", "PriceClose", "priceClose", "ClosePrice", "close"]
+            )
+            volume = _first_present(latest, ["TotalVolume", "Volume", "volume", "NmVolume"]) or 0
+
+            result[ticker] = {
+                "close": float(close),
+                "prev_close": float(prev_close) if prev_close else None,
+                "volume": int(volume),
+            }
+        except Exception as e:
+            print(f"FireAnt fetch failed for {ticker}: {e}")
+            continue
+    return result
+
+
+# --- Source 3: VNDirect --------------------------------------------------------
 
 
 def _fetch_vndirect_rows(codes, days_back=15):
     """Returns raw rows from VNDirect's stock_prices feed for the given
-    codes (list of tickers/index codes) over the last `days_back` days,
-    newest first. One HTTP call covers the whole list.
+    codes (list of tickers/index codes) over the last `days_back` days.
+    One HTTP call covers the whole list of codes.
     """
     today = now_vn().date()
     from_date = (today - timedelta(days=days_back)).isoformat()
@@ -146,21 +289,18 @@ def _fetch_vndirect_rows(codes, days_back=15):
     params = {
         "sort": "date:desc",
         "q": query,
-        # generous size: up to days_back rows per code
         "size": days_back * max(len(codes), 1),
         "page": 1,
     }
-    resp = requests.get(VNDIRECT_QUOTES_URL, headers=HEADERS, params=params, timeout=20)
+    resp = requests.get(
+        VNDIRECT_QUOTES_URL, headers=HEADERS, params=params, timeout=REQUEST_TIMEOUT
+    )
     resp.raise_for_status()
     data = resp.json()
     return data.get("data") or []
 
 
-def _rows_to_latest_prev(rows, codes):
-    """Groups raw VNDirect rows by code and returns
-    {code: {"close": float, "prev_close": float|None, "volume": int}}.
-    Assumes rows are not necessarily sorted; sorts per-code by date desc.
-    """
+def _vndirect_rows_to_latest_prev(rows, codes):
     by_code = {}
     for row in rows:
         code = row.get("code")
@@ -184,19 +324,17 @@ def _rows_to_latest_prev(rows, codes):
     return result
 
 
-def fetch_vndirect_stock_prices():
+def fetch_vndirect_stock_prices(tickers):
     """Returns {ticker: {"close": VND, "prev_close": VND|None, "volume": int}}
-    for the watchlist. VNDirect closes are already in plain VND.
-    """
-    rows = _fetch_vndirect_rows(WATCHLIST)
-    return _rows_to_latest_prev(rows, set(WATCHLIST))
+    for the given tickers in one batched HTTP call."""
+    rows = _fetch_vndirect_rows(tickers)
+    return _vndirect_rows_to_latest_prev(rows, set(tickers))
 
 
 def fetch_vndirect_indices():
-    """Returns {index_label: {"close": pts, "prev_close": pts|None}}."""
     codes = [code for code, _label in INDICES]
     rows = _fetch_vndirect_rows(codes)
-    by_code = _rows_to_latest_prev(rows, set(codes))
+    by_code = _vndirect_rows_to_latest_prev(rows, set(codes))
     result = {}
     for code, label in INDICES:
         if code in by_code:
@@ -205,6 +343,60 @@ def fetch_vndirect_indices():
                 "prev_close": by_code[code]["prev_close"],
             }
     return result
+
+
+# --- Cascade across sources ----------------------------------------------------
+
+STOCK_SOURCES = [
+    ("CafeF", fetch_cafef_stock_prices),
+    ("FireAnt", fetch_fireant_stock_prices),
+    ("VNDirect", fetch_vndirect_stock_prices),
+]
+
+INDEX_SOURCES = [
+    ("CafeF", fetch_cafef_indices),
+    ("VNDirect", fetch_vndirect_indices),
+]
+
+
+def fetch_all_stock_prices():
+    """Tries each source in order, only asking for tickers still missing
+    after the previous source. Returns (prices_dict, {ticker: source_name}).
+    A block or outage on one source just means the next one fills the gaps.
+    """
+    prices = {}
+    used_source = {}
+    for name, fetch_fn in STOCK_SOURCES:
+        missing = [t for t in WATCHLIST if t not in prices]
+        if not missing:
+            break
+        try:
+            partial = fetch_fn(missing)
+        except Exception as e:
+            print(f"{name} source failed entirely: {e}")
+            continue
+        for ticker, vals in partial.items():
+            if ticker not in prices:
+                prices[ticker] = vals
+                used_source[ticker] = name
+    return prices, used_source
+
+
+def fetch_all_indices():
+    indices = {}
+    for name, fetch_fn in INDEX_SOURCES:
+        missing = [label for _code, label in INDICES if label not in indices]
+        if not missing:
+            break
+        try:
+            partial = fetch_fn()
+        except Exception as e:
+            print(f"{name} index source failed entirely: {e}")
+            continue
+        for label, vals in partial.items():
+            if label not in indices:
+                indices[label] = vals
+    return indices
 
 
 # --- State (for % change + threshold) --------------------------------------
@@ -322,7 +514,7 @@ def gainers_losers_section(prices):
 # --- Formatting -------------------------------------------------------------
 
 
-def format_email_body(prices, indices, previous_prices):
+def format_email_body(prices, indices, used_source, previous_prices):
     lines = [f"Vietnam stock watchlist - {now_vn().strftime('%Y-%m-%d %H:%M')} (Asia/Ho_Chi_Minh)\n"]
 
     if indices:
@@ -342,33 +534,36 @@ def format_email_body(prices, indices, previous_prices):
     if movers:
         lines += movers + [""]
 
-    lines.append(f"{SOURCE_NAME} closing prices")
-    lines.append(f"{'Ticker':<8}{'Close (VND)':<16}{'Change':<14}{'Volume'}")
-    lines.append("-" * 42)
+    lines.append("Closing prices")
+    lines.append(f"{'Ticker':<8}{'Close (VND)':<16}{'Change':<14}{'Volume':<14}{'Source'}")
+    lines.append("-" * 60)
     for ticker in WATCHLIST:
         vals = prices.get(ticker)
         if not vals:
-            lines.append(f"{ticker:<8}unavailable this run")
+            lines.append(f"{ticker:<8}unavailable this run (all sources failed)")
             continue
         change_str = ""
         if vals.get("prev_close"):
             pct = (vals["close"] - vals["prev_close"]) / vals["prev_close"] * 100
             arrow = "UP" if pct > 0 else ("DOWN" if pct < 0 else "FLAT")
             change_str = f"{arrow} {pct:+.2f}%"
-        lines.append(f"{ticker:<8}{vals['close']:,.0f}{'':<6}{change_str:<14}{vals.get('volume', 0):,.0f}")
+        lines.append(
+            f"{ticker:<8}{vals['close']:,.0f}{'':<6}{change_str:<14}"
+            f"{vals.get('volume', 0):,.0f}{'':<8}{used_source.get(ticker, '?')}"
+        )
 
     trend = weekly_trend_section()
     if trend:
         lines.append("")
         lines += trend
 
+    sources_used = sorted(set(used_source.values()))
     lines.append("")
-    lines.append("Source:")
-    lines.append(f"  {SOURCE_NAME}: {SOURCE_URL}")
-    lines.append("")
+    if sources_used:
+        lines.append(f"Sources that supplied data this run: {', '.join(sources_used)}")
     lines.append(
-        "Note: this is a public feed behind VNDirect's own app, not a documented/"
-        "guaranteed API. Verify against your broker before trading on it."
+        "Note: these are public feeds behind each provider's own app, not documented/"
+        "guaranteed APIs. Verify against your broker before trading on them."
     )
 
     return "\n".join(lines)
@@ -393,15 +588,10 @@ def send_email(body):
 
 
 def cmd_generate():
-    try:
-        prices = fetch_vndirect_stock_prices()
-    except Exception as e:
-        print(f"VNDirect fetch failed ({e}), aborting this run.")
-        open(EMAIL_BODY_FILE, "w").close()
-        return
+    prices, used_source = fetch_all_stock_prices()
 
     if not prices:
-        print("No prices fetched, aborting this run.")
+        print("No prices fetched from any source, aborting this run.")
         open(EMAIL_BODY_FILE, "w").close()
         return
 
@@ -413,12 +603,12 @@ def cmd_generate():
         return
 
     try:
-        indices = fetch_vndirect_indices()
+        indices = fetch_all_indices()
     except Exception as e:
         print(f"Index fetch failed ({e}), continuing without it.")
         indices = {}
 
-    body = format_email_body(prices, indices, previous_prices)
+    body = format_email_body(prices, indices, used_source, previous_prices)
     with open(EMAIL_BODY_FILE, "w") as f:
         f.write(body)
 
