@@ -82,7 +82,20 @@ def now_vn():
 DEFAULT_WATCHLIST = [
     "VNM", "VIC", "VHM", "HPG", "FPT", "MWG", "VCB", "TCB", "MBB", "SSI",
 ]
-WATCHLIST = os.environ.get("WATCHLIST", ",".join(DEFAULT_WATCHLIST)).split(",")
+
+
+def _env(name, default=None):
+    """os.environ.get, but treats an unset-but-present GitHub Actions
+    variable (which comes through as an empty string, not a missing key)
+    the same as truly unset.
+    """
+    val = os.environ.get(name)
+    if val is None or val.strip() == "":
+        return default
+    return val
+
+
+WATCHLIST = _env("WATCHLIST", ",".join(DEFAULT_WATCHLIST)).split(",")
 WATCHLIST = [t.strip().upper() for t in WATCHLIST if t.strip()]
 
 INDICES = [
@@ -103,14 +116,14 @@ EMAIL_BODY_FILE = "email_body.txt"
 STATE_FILE = "last_prices.json"
 HISTORY_FILE = "price_history.csv"
 
-ALERT_THRESHOLD_PERCENT = os.environ.get("ALERT_THRESHOLD_PERCENT")
+ALERT_THRESHOLD_PERCENT = _env("ALERT_THRESHOLD_PERCENT")
 ALERT_THRESHOLD_PERCENT = float(ALERT_THRESHOLD_PERCENT) if ALERT_THRESHOLD_PERCENT else None
 
-DISCREPANCY_THRESHOLD_PERCENT = float(os.environ.get("DISCREPANCY_THRESHOLD_PERCENT", "1.0"))
+DISCREPANCY_THRESHOLD_PERCENT = float(_env("DISCREPANCY_THRESHOLD_PERCENT", "1.0"))
 
-GMAIL_ADDRESS = os.environ.get("GMAIL_ADDRESS")
-GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
-STOCK_RECIPIENT = os.environ.get("STOCK_RECIPIENT")
+GMAIL_ADDRESS = _env("GMAIL_ADDRESS")
+GMAIL_APP_PASSWORD = _env("GMAIL_APP_PASSWORD")
+STOCK_RECIPIENT = _env("STOCK_RECIPIENT")
 
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
