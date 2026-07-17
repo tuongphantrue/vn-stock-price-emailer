@@ -24,7 +24,15 @@ the others):
    already in plain VND, no thousand-scaling needed. HNX-Index and
    UPCOM-Index don't have a confirmed Yahoo ticker, so those two fall
    through to the sources below.
-2. CafeF (s.cafef.vn) - public AJAX endpoint behind cafef.vn's own price
+2. TradingView (scanner.tradingview.com) - TradingView's own scanner/
+   screener API, confirmed via an open-source Python wrapper's docs and
+   usage examples (one of its own examples successfully queries a
+   Vietnamese ticker, HOSE:VIX, in the same batched call as US tickers).
+   Also globally-hosted infrastructure, same category as Yahoo above.
+   Assumes HOSE listing for stock tickers (true for the default
+   watchlist) - a ticker on another exchange just comes back empty here
+   and falls through to the next source rather than erroring.
+3. CafeF (s.cafef.vn) - public AJAX endpoint behind cafef.vn's own price
    history pages. Field names verified against several independent
    scrapers using this exact endpoint over multiple years. Requires an
    X-Requested-With: XMLHttpRequest header - without it, the endpoint
@@ -32,7 +40,7 @@ the others):
    appears to reject requests from cloud/datacenter IP ranges (returns
    the same empty/error body regardless of headers sent from GitHub
    Actions), so treat this as a fallback rather than reliable from CI.
-3. VNDirect (finfo-api.vndirect.com.vn) - confirmed reachable and
+4. VNDirect (finfo-api.vndirect.com.vn) - confirmed reachable and
    correctly-shaped in earlier testing, but times out entirely from
    GitHub Actions runners (Azure IP ranges appear to be blocked). Kept as
    a last-resort fallback since it may work fine from a non-cloud IP
@@ -123,6 +131,7 @@ INDICES = [
 ]
 
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+TRADINGVIEW_SCAN_URL = "https://scanner.tradingview.com/scan"
 CAFEF_HISTORY_URL = "https://s.cafef.vn/Ajax/PageNew/DataHistory/PriceHistory.ashx"
 VNDIRECT_QUOTES_URL = "https://finfo-api.vndirect.com.vn/v4/stock_prices"
 
@@ -264,7 +273,106 @@ def fetch_yahoo_indices():
     return result
 
 
-# --- Source 2: CafeF ----------------------------------------------------------
+# --- Source 2: TradingView -------------------------------------------------------
+
+
+def _tradingview_scan(qualified_tickers, columns):
+    """POSTs a batch scan request for fully-qualified TradingView tickers
+    (e.g. "HOSE:VNM") and returns {bare_ticker: {column_name: value}}. One
+    HTTP call covers the whole batch, across mixed exchanges if needed.
+    """
+    resp = requests.post(
+        TRADINGVIEW_SCAN_URL,
+        headers=HEADERS,
+        json={"symbols": {"tickers": qualified_tickers, "query": {"types": []}}, "columns": columns},
+        timeout=REQUEST_TIMEOUT,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    rows = data.get("data") or []
+    if not rows and DEBUG_EMPTY_RESPONSES:
+        print(f"TradingView empty scan response: {json.dumps(data)[:200]}")
+    result = {}
+    for row in rows:
+        symbol = row.get("s", "")
+        bare = symbol.split(":", 1)[-1]
+        values = row.get("d") or []
+        result[bare] = dict(zip(columns, values))
+    return result
+
+
+def _tradingview_prev_close(close, change_pct):
+    """TradingView's scanner returns today's % change directly rather than
+    yesterday's close, so prev_close is derived: close = prev * (1 + pct/100).
+    """
+    if close is None or change_pct is None or change_pct <= -100:
+        return None
+    return close / (1 + change_pct / 100)
+
+
+def fetch_tradingview_stock_prices(tickers):
+    """Returns {ticker: {"close": VND, "prev_close": VND|None, "volume": int}}.
+    Assumes HOSE listing, which covers the default large-cap watchlist. A
+    ticker actually listed on HNX/UPCOM will simply come back with no data
+    here (not an error) and fall through to the next source instead.
+    """
+    result = {}
+    try:
+        qualified = [f"HOSE:{t}" for t in tickers]
+        rows = _tradingview_scan(qualified, ["close", "change", "volume"])
+    except Exception as e:
+        print(f"TradingView fetch failed entirely: {e}")
+        return result
+
+    for ticker in tickers:
+        vals = rows.get(ticker)
+        if not vals or vals.get("close") is None:
+            continue
+        close = vals["close"]
+        prev_close = _tradingview_prev_close(close, vals.get("change"))
+        result[ticker] = {
+            "close": float(close),
+            "prev_close": float(prev_close) if prev_close is not None else None,
+            "volume": int(vals.get("volume") or 0),
+        }
+    return result
+
+
+def fetch_tradingview_indices():
+    """VN-Index is confirmed under HOSE:VNINDEX (seen directly on
+    TradingView's own site). HNX-Index / UPCOM-Index ticker qualifiers
+    (HNX:HNXINDEX, UPCOM:UPCOMINDEX) follow the same exchange:ticker
+    convention but weren't independently confirmed - if they're wrong,
+    those two labels just come back empty and fall through to CafeF/
+    VNDirect, same graceful-miss behavior as everywhere else in this file.
+    """
+    index_tickers = {
+        "HOSE:VNINDEX": "VN-Index",
+        "HNX:HNXINDEX": "HNX-Index",
+        "UPCOM:UPCOMINDEX": "UPCOM-Index",
+    }
+    result = {}
+    try:
+        rows = _tradingview_scan(list(index_tickers.keys()), ["close", "change"])
+    except Exception as e:
+        print(f"TradingView index fetch failed entirely: {e}")
+        return result
+
+    for qualified, label in index_tickers.items():
+        bare = qualified.split(":", 1)[-1]
+        vals = rows.get(bare)
+        if not vals or vals.get("close") is None:
+            continue
+        close = vals["close"]
+        prev_close = _tradingview_prev_close(close, vals.get("change"))
+        result[label] = {
+            "close": float(close),
+            "prev_close": float(prev_close) if prev_close is not None else None,
+        }
+    return result
+
+
+# --- Source 3: CafeF ----------------------------------------------------------
 
 
 def _fetch_cafef_history(symbol, page_size=5):
@@ -350,7 +458,7 @@ def fetch_cafef_indices():
     return result
 
 
-# --- Source 3: VNDirect --------------------------------------------------------
+# --- Source 4: VNDirect --------------------------------------------------------
 
 
 def _fetch_vndirect_rows(codes, days_back=15):
@@ -425,12 +533,14 @@ def fetch_vndirect_indices():
 
 STOCK_SOURCES = [
     ("Yahoo Finance", fetch_yahoo_stock_prices),
+    ("TradingView", fetch_tradingview_stock_prices),
     ("CafeF", fetch_cafef_stock_prices),
     ("VNDirect", fetch_vndirect_stock_prices),
 ]
 
 INDEX_SOURCES = [
     ("Yahoo Finance", fetch_yahoo_indices),
+    ("TradingView", fetch_tradingview_indices),
     ("CafeF", fetch_cafef_indices),
     ("VNDirect", fetch_vndirect_indices),
 ]
