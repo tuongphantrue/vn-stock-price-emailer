@@ -2,39 +2,39 @@
 vn_stock_price_emailer.py
 
 Fetches prices for a watchlist of Vietnam-listed stocks (HOSE/HNX/UPCOM),
-plus the major indices (VN-Index, HNX-Index, UPCOM-Index), from two
-independent free/no-key public sources, and emails a daily summary.
-Designed to run on GitHub Actions (see .github/workflows/send-stock-price.yml)
-or locally via cron. No local computer needs to stay on.
+plus the major indices (VN-Index, HNX-Index, UPCOM-Index), from VNDirect's
+public quotes feed, and emails a daily summary. Designed to run on GitHub
+Actions (see .github/workflows/send-stock-price.yml) or locally via cron.
+No local computer needs to stay on.
 
 Modeled on the same pattern as currency-rate-emailer / gold-price-emailer /
-tech-price-mailer: multiple independent sources, each rendered as its own
-section, each degrades gracefully if it fails on a given run.
+tech-price-mailer: pulls from a public source, degrades gracefully per
+ticker if a lookup fails, tracks state/history, and emails a summary.
 
-Data sources:
+Data source:
 
-1. TCBS public price-history feed (apipubaws.tcbs.com.vn) - used for the
-   latest daily close, previous close, volume, and index levels. This is
-   the same public feed the `vnstock` Python package wraps; it is not an
-   official/documented API, so treat it as best-effort and expect it may
-   change shape or rate-limit without notice.
-2. VNDirect public quotes feed (finfo-api.vndirect.com.vn) - independent
-   second source for latest close + daily change, used for a cross-check.
+    VNDirect public quotes feed (finfo-api.vndirect.com.vn/v4/stock_prices)
+    - the same feed a number of independent open-source VN stock tools
+      (vnquant, MiAI_Airflow, etc.) have used for years. Not a documented/
+      versioned API, so it can change shape or rate-limit without notice -
+      same caveat the Vietcombank source carries in currency-rate-emailer.
 
-Both are undocumented public JSON endpoints that happen to back TCBS's and
-VNDirect's own web/mobile apps, not stable published APIs - the same
-caveat the Vietcombank source in currency-rate-emailer carries. If either
-one goes down or changes shape, the run should still complete and email
-using whichever source(s) succeeded; this script is written defensively
-for that. Swap in a proper vendor (SSI FastConnect, a paid VN data API,
-etc.) if you need contractual reliability.
+    NOTE on history: this script originally also pulled from TCBS's public
+    feed (apipubaws.tcbs.com.vn) as a second, cross-checked source. That
+    feed now 404s on every ticker because the `vnstock` project's own
+    maintainers removed TCBS as a supported data source entirely - it's
+    not coming back. TCBS has been dropped from this script rather than
+    kept as a permanently-broken fallback. If you want a second
+    independent source back for cross-checking, VCI's (Vietcap's) public
+    feed at trading.vietcap.com.vn is the current vnstock default source
+    and would be the next one to add - it wasn't wired up here because its
+    exact endpoint/response shape couldn't be verified in this environment
+    (no live network access while writing this).
 
 Extra features (matching the sibling emailers):
 
 - Daily % change per stock, with an UP/DOWN/FLAT arrow
 - Top gainers / top losers within the watchlist
-- Cross-source discrepancy alert: flags tickers where TCBS and VNDirect
-  closes disagree by more than a threshold
 - Market index snapshot: VN-Index, HNX-Index, UPCOM-Index
 - Historical tracking + weekly trend: logs every run to price_history.csv
   and emails a 7-day % change summary once a week
@@ -51,17 +51,15 @@ Required environment variables (set as GitHub Actions secrets, or export locally
     STOCK_RECIPIENT     - recipient email address
 
 Optional environment variables:
-    WATCHLIST                      - comma-separated tickers, default below
-    ALERT_THRESHOLD_PERCENT        - only send if some stock moved >= this % since last run
-                                      (leave unset to always send)
-    DISCREPANCY_THRESHOLD_PERCENT  - flag a ticker if sources disagree by >= this % (default 1.0)
+    WATCHLIST                - comma-separated tickers, default below
+    ALERT_THRESHOLD_PERCENT  - only send if some stock moved >= this % since last run
+                                (leave unset to always send)
 """
 
 import os
 import sys
 import csv
 import json
-import time
 import smtplib
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -104,13 +102,10 @@ INDICES = [
     ("UPCOMINDEX", "UPCOM-Index"),
 ]
 
-TCBS_BARS_URL = "https://apipubaws.tcbs.com.vn/stock-insight/v1/stock/bars-long-term"
 VNDIRECT_QUOTES_URL = "https://finfo-api.vndirect.com.vn/v4/stock_prices"
 
-SOURCES = [
-    ("TCBS", "https://tcinvest.tcbs.com.vn/"),
-    ("VNDirect", "https://dstock.vndirect.com.vn/"),
-]
+SOURCE_NAME = "VNDirect"
+SOURCE_URL = "https://dstock.vndirect.com.vn/"
 
 EMAIL_BODY_FILE = "email_body.txt"
 STATE_FILE = "last_prices.json"
@@ -118,8 +113,6 @@ HISTORY_FILE = "price_history.csv"
 
 ALERT_THRESHOLD_PERCENT = _env("ALERT_THRESHOLD_PERCENT")
 ALERT_THRESHOLD_PERCENT = float(ALERT_THRESHOLD_PERCENT) if ALERT_THRESHOLD_PERCENT else None
-
-DISCREPANCY_THRESHOLD_PERCENT = float(_env("DISCREPANCY_THRESHOLD_PERCENT", "1.0"))
 
 GMAIL_ADDRESS = _env("GMAIL_ADDRESS")
 GMAIL_APP_PASSWORD = _env("GMAIL_APP_PASSWORD")
@@ -129,8 +122,8 @@ SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
 
 HEADERS = {
-    # Several of these hosts block the bare default "python-requests/x.y"
-    # User-Agent, so we look like an ordinary browser instead.
+    # This host blocks the bare default "python-requests/x.y" User-Agent,
+    # so we look like an ordinary browser instead.
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -138,115 +131,80 @@ HEADERS = {
     "Accept": "application/json",
 }
 
-# --- Fetch: TCBS ----------------------------------------------------------
+# --- Fetch: VNDirect ---------------------------------------------------------
 
 
-def _fetch_tcbs_bars(ticker, asset_type, days_back=14):
-    """Returns a list of daily bars (oldest -> newest) for one ticker/index
-    from TCBS's public bars feed: [{tradingDate, close, volume}, ...]
+def _fetch_vndirect_rows(codes, days_back=15):
+    """Returns raw rows from VNDirect's stock_prices feed for the given
+    codes (list of tickers/index codes) over the last `days_back` days,
+    newest first. One HTTP call covers the whole list.
     """
-    to_ts = int(time.time())
-    from_ts = to_ts - days_back * 86400
+    today = now_vn().date()
+    from_date = (today - timedelta(days=days_back)).isoformat()
+    to_date = today.isoformat()
+    query = f"code:{','.join(codes)}~date:gte:{from_date}~date:lte:{to_date}"
     params = {
-        "ticker": ticker,
-        "type": asset_type,  # "stock" or "index"
-        "resolution": "D",
-        "from": from_ts,
-        "to": to_ts,
+        "sort": "date:desc",
+        "q": query,
+        # generous size: up to days_back rows per code
+        "size": days_back * max(len(codes), 1),
+        "page": 1,
     }
-    resp = requests.get(TCBS_BARS_URL, headers=HEADERS, params=params, timeout=15)
+    resp = requests.get(VNDIRECT_QUOTES_URL, headers=HEADERS, params=params, timeout=20)
     resp.raise_for_status()
     data = resp.json()
-    bars = data.get("data") or []
-    bars.sort(key=lambda b: b.get("tradingDate", ""))
-    return bars
+    return data.get("data") or []
 
 
-def fetch_tcbs_stock_prices():
-    """Returns {ticker: {"close": VND, "prev_close": VND, "volume": int}}.
-    TCBS bars come back in *thousand VND* for stock prices (e.g. 85.5 == 85,500 VND),
-    so we scale by 1000 to get plain VND like the other emailers use for currency.
+def _rows_to_latest_prev(rows, codes):
+    """Groups raw VNDirect rows by code and returns
+    {code: {"close": float, "prev_close": float|None, "volume": int}}.
+    Assumes rows are not necessarily sorted; sorts per-code by date desc.
     """
-    prices = {}
-    for ticker in WATCHLIST:
-        try:
-            bars = _fetch_tcbs_bars(ticker, "stock")
-            if len(bars) < 1:
-                continue
-            latest = bars[-1]
-            prev = bars[-2] if len(bars) >= 2 else None
-            prices[ticker] = {
-                "close": float(latest["close"]) * 1000,
-                "prev_close": float(prev["close"]) * 1000 if prev else None,
-                "volume": int(latest.get("volume") or 0),
-            }
-        except Exception as e:
-            print(f"TCBS fetch failed for {ticker}: {e}")
+    by_code = {}
+    for row in rows:
+        code = row.get("code")
+        if code not in codes:
             continue
-    return prices
+        by_code.setdefault(code, []).append(row)
+
+    result = {}
+    for code, code_rows in by_code.items():
+        code_rows.sort(key=lambda r: r.get("date", ""), reverse=True)
+        latest = code_rows[0]
+        prev = code_rows[1] if len(code_rows) >= 2 else None
+        close = latest.get("close") or latest.get("adClose")
+        if close is None:
+            continue
+        result[code] = {
+            "close": float(close),
+            "prev_close": float(prev["close"]) if prev and prev.get("close") else None,
+            "volume": int(latest.get("nmVolume") or latest.get("volume") or 0),
+        }
+    return result
 
 
-def fetch_tcbs_indices():
-    """Returns {index_name: {"close": pts, "prev_close": pts}} for VN-Index etc."""
-    indices = {}
+def fetch_vndirect_stock_prices():
+    """Returns {ticker: {"close": VND, "prev_close": VND|None, "volume": int}}
+    for the watchlist. VNDirect closes are already in plain VND.
+    """
+    rows = _fetch_vndirect_rows(WATCHLIST)
+    return _rows_to_latest_prev(rows, set(WATCHLIST))
+
+
+def fetch_vndirect_indices():
+    """Returns {index_label: {"close": pts, "prev_close": pts|None}}."""
+    codes = [code for code, _label in INDICES]
+    rows = _fetch_vndirect_rows(codes)
+    by_code = _rows_to_latest_prev(rows, set(codes))
+    result = {}
     for code, label in INDICES:
-        try:
-            bars = _fetch_tcbs_bars(code, "index")
-            if len(bars) < 1:
-                continue
-            latest = bars[-1]
-            prev = bars[-2] if len(bars) >= 2 else None
-            indices[label] = {
-                "close": float(latest["close"]),
-                "prev_close": float(prev["close"]) if prev else None,
+        if code in by_code:
+            result[label] = {
+                "close": by_code[code]["close"],
+                "prev_close": by_code[code]["prev_close"],
             }
-        except Exception as e:
-            print(f"TCBS index fetch failed for {label}: {e}")
-            continue
-    return indices
-
-
-# --- Fetch: VNDirect --------------------------------------------------------
-
-
-def fetch_vndirect_prices():
-    """Returns {ticker: {"close": VND, "prev_close": VND}} from VNDirect's
-    public quotes feed, used as an independent cross-check on TCBS.
-    VNDirect closes are already in plain VND.
-    """
-    prices = {}
-    codes = ",".join(WATCHLIST)
-    params = {
-        "sort": "date",
-        "q": f"code:{codes}",
-        "size": len(WATCHLIST) * 2,
-    }
-    try:
-        resp = requests.get(VNDIRECT_QUOTES_URL, headers=HEADERS, params=params, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-        rows = data.get("data") or []
-        by_ticker = {}
-        for row in rows:
-            code = row.get("code")
-            if code not in WATCHLIST:
-                continue
-            by_ticker.setdefault(code, []).append(row)
-        for code, rows_for_code in by_ticker.items():
-            rows_for_code.sort(key=lambda r: r.get("date", ""), reverse=True)
-            latest = rows_for_code[0]
-            prev = rows_for_code[1] if len(rows_for_code) >= 2 else None
-            close = latest.get("close") or latest.get("adClose")
-            if close is None:
-                continue
-            prices[code] = {
-                "close": float(close),
-                "prev_close": float(prev["close"]) if prev and prev.get("close") else None,
-            }
-    except Exception as e:
-        print(f"VNDirect fetch failed: {e}")
-        raise
-    return prices
+    return result
 
 
 # --- State (for % change + threshold) --------------------------------------
@@ -280,7 +238,7 @@ def should_send(prices, previous_prices):
 
 
 def append_history(prices):
-    """Appends this run's TCBS closes to a CSV: timestamp,ticker,close"""
+    """Appends this run's closes to a CSV: timestamp,ticker,close"""
     is_new_file = not os.path.exists(HISTORY_FILE)
     with open(HISTORY_FILE, "a", newline="") as f:
         writer = csv.writer(f)
@@ -335,7 +293,7 @@ def weekly_trend_section():
     return ["Weekly trend (7-day change)"] + ["-" * 42] + lines
 
 
-# --- Gainers / losers + discrepancy analysis ---------------------------------
+# --- Gainers / losers ---------------------------------------------------------
 
 
 def gainers_losers_section(prices):
@@ -361,27 +319,10 @@ def gainers_losers_section(prices):
     return lines if (gainers or losers) else None
 
 
-def discrepancy_section(tcbs_prices, vndirect_prices):
-    """Flags tickers where TCBS and VNDirect closes disagree by >= threshold."""
-    lines = []
-    for ticker in WATCHLIST:
-        a = tcbs_prices.get(ticker, {}).get("close")
-        b = vndirect_prices.get(ticker, {}).get("close")
-        if not a or not b:
-            continue
-        spread_pct = abs(a - b) / min(a, b) * 100
-        if spread_pct >= DISCREPANCY_THRESHOLD_PERCENT:
-            lines.append(f"{ticker:<8} TCBS {a:,.0f} vs VNDirect {b:,.0f} VND (diff {spread_pct:.2f}%)")
-
-    if not lines:
-        return None
-    return [f"Source discrepancy alert (>= {DISCREPANCY_THRESHOLD_PERCENT:.1f}% spread)"] + ["-" * 42] + lines
-
-
 # --- Formatting -------------------------------------------------------------
 
 
-def format_email_body(prices, indices, vndirect_prices, previous_prices, vndirect_error=None):
+def format_email_body(prices, indices, previous_prices):
     lines = [f"Vietnam stock watchlist - {now_vn().strftime('%Y-%m-%d %H:%M')} (Asia/Ho_Chi_Minh)\n"]
 
     if indices:
@@ -401,11 +342,7 @@ def format_email_body(prices, indices, vndirect_prices, previous_prices, vndirec
     if movers:
         lines += movers + [""]
 
-    discrepancy = discrepancy_section(prices, vndirect_prices)
-    if discrepancy:
-        lines += discrepancy + [""]
-
-    lines.append("TCBS closing prices")
+    lines.append(f"{SOURCE_NAME} closing prices")
     lines.append(f"{'Ticker':<8}{'Close (VND)':<16}{'Change':<14}{'Volume'}")
     lines.append("-" * 42)
     for ticker in WATCHLIST:
@@ -420,34 +357,18 @@ def format_email_body(prices, indices, vndirect_prices, previous_prices, vndirec
             change_str = f"{arrow} {pct:+.2f}%"
         lines.append(f"{ticker:<8}{vals['close']:,.0f}{'':<6}{change_str:<14}{vals.get('volume', 0):,.0f}")
 
-    used_sources = [SOURCES[0]]
-
-    if vndirect_prices:
-        lines.append("")
-        lines.append("VNDirect closing prices (cross-check)")
-        lines.append(f"{'Ticker':<8}{'Close (VND)'}")
-        lines.append("-" * 42)
-        for ticker in WATCHLIST:
-            if ticker in vndirect_prices:
-                lines.append(f"{ticker:<8}{vndirect_prices[ticker]['close']:,.0f}")
-        used_sources.append(SOURCES[1])
-    elif vndirect_error:
-        lines.append("")
-        lines.append(f"VNDirect: unavailable this run ({vndirect_error})")
-
     trend = weekly_trend_section()
     if trend:
         lines.append("")
         lines += trend
 
     lines.append("")
-    lines.append("Sources:")
-    for name, url in used_sources:
-        lines.append(f"  {name}: {url}")
+    lines.append("Source:")
+    lines.append(f"  {SOURCE_NAME}: {SOURCE_URL}")
     lines.append("")
     lines.append(
-        "Note: these are public feeds behind TCBS's and VNDirect's own apps, not "
-        "documented/guaranteed APIs. Verify against your broker before trading on them."
+        "Note: this is a public feed behind VNDirect's own app, not a documented/"
+        "guaranteed API. Verify against your broker before trading on it."
     )
 
     return "\n".join(lines)
@@ -472,9 +393,15 @@ def send_email(body):
 
 
 def cmd_generate():
-    prices = fetch_tcbs_stock_prices()
+    try:
+        prices = fetch_vndirect_stock_prices()
+    except Exception as e:
+        print(f"VNDirect fetch failed ({e}), aborting this run.")
+        open(EMAIL_BODY_FILE, "w").close()
+        return
+
     if not prices:
-        print("No prices fetched from TCBS, aborting this run.")
+        print("No prices fetched, aborting this run.")
         open(EMAIL_BODY_FILE, "w").close()
         return
 
@@ -486,20 +413,12 @@ def cmd_generate():
         return
 
     try:
-        indices = fetch_tcbs_indices()
+        indices = fetch_vndirect_indices()
     except Exception as e:
         print(f"Index fetch failed ({e}), continuing without it.")
         indices = {}
 
-    try:
-        vndirect_prices = fetch_vndirect_prices()
-        vndirect_error = None
-    except Exception as e:
-        print(f"VNDirect source failed ({e}), continuing without it.")
-        vndirect_prices = {}
-        vndirect_error = str(e)
-
-    body = format_email_body(prices, indices, vndirect_prices, previous_prices, vndirect_error)
+    body = format_email_body(prices, indices, previous_prices)
     with open(EMAIL_BODY_FILE, "w") as f:
         f.write(body)
 
