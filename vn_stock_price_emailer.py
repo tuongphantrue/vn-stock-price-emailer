@@ -17,20 +17,19 @@ the others):
 
 1. CafeF (s.cafef.vn) - public AJAX endpoint behind cafef.vn's own price
    history pages. Field names verified against several independent
-   scrapers using this exact endpoint over multiple years.
-2. FireAnt (restv2.fireant.vn) - public endpoint behind fireant.vn's own
-   site. Response field names were NOT independently verifiable while
-   writing this (no live network access in this environment) - the parser
-   tries several plausible field names and simply skips a ticker if none
-   match, so a schema mismatch degrades gracefully instead of reporting a
-   wrong number. Worth double-checking the first real email against
-   https://fireant.vn for a sanity check.
-3. VNDirect (finfo-api.vndirect.com.vn) - the original source used here.
-   Confirmed reachable and correctly-shaped in earlier testing, but times
-   out entirely from GitHub Actions runners (Azure IP ranges appear to be
-   blocked). Kept as a third attempt since it may work fine if you run
-   this from a non-cloud IP (e.g. your own machine, or a self-hosted
-   runner), and costs nothing to try last.
+   scrapers using this exact endpoint over multiple years. Requires an
+   X-Requested-With: XMLHttpRequest header - without it, the endpoint
+   returns HTTP 200 with an empty/error body instead of real data.
+2. VNDirect (finfo-api.vndirect.com.vn) - confirmed reachable and
+   correctly-shaped in earlier testing, but times out entirely from
+   GitHub Actions runners (Azure IP ranges appear to be blocked). Kept as
+   a fallback since it may work fine from a non-cloud IP (e.g. your own
+   machine, or a self-hosted runner), and costs nothing to try last.
+
+(FireAnt was tried as a third source but dropped: its documented-looking
+endpoint 404s outright, and other people's write-ups of FireAnt's API note
+it may require authentication that isn't publicly available - not worth
+guessing at further without real docs.)
 
 None of these are documented/versioned APIs - they're the public JSON
 endpoints behind each site's own web app, the same category of caveat the
@@ -111,7 +110,6 @@ INDICES = [
 ]
 
 CAFEF_HISTORY_URL = "https://s.cafef.vn/Ajax/PageNew/DataHistory/PriceHistory.ashx"
-FIREANT_QUOTES_URL = "https://restv2.fireant.vn/stocks/{symbol}/quotes"
 VNDIRECT_QUOTES_URL = "https://finfo-api.vndirect.com.vn/v4/stock_prices"
 
 EMAIL_BODY_FILE = "email_body.txt"
@@ -142,7 +140,16 @@ HEADERS = {
 # an empty result set to requests that don't look like they came from the
 # site itself, rather than an HTTP error. Send matching headers to look like
 # a real page load.
-CAFEF_HEADERS = dict(HEADERS, Referer="https://cafef.vn/", Origin="https://cafef.vn")
+CAFEF_HEADERS = dict(
+    HEADERS,
+    Referer="https://cafef.vn/",
+    Origin="https://cafef.vn",
+    # CafeF's .ashx handler returned HTTP 200 with {"Message":"symbol is null
+    # or empty"} for every ticker until this header was added - it appears
+    # to require this to treat the request as a genuine in-page AJAX call
+    # before it will read the query string at all.
+    **{"X-Requested-With": "XMLHttpRequest"},
+)
 REQUEST_TIMEOUT = 15
 DEBUG_EMPTY_RESPONSES = _env("DEBUG_EMPTY_RESPONSES") is not None
 
@@ -254,60 +261,7 @@ def fetch_cafef_indices():
     return result
 
 
-# --- Source 2: FireAnt ---------------------------------------------------------
-
-
-def fetch_fireant_stock_prices(tickers):
-    """Returns {ticker: {"close": VND, "prev_close": VND|None, "volume": int}}.
-    Best-effort: tries several plausible field names since the exact schema
-    wasn't independently verifiable while writing this. Skips a ticker
-    entirely (rather than guessing) if none of the candidate fields match.
-    """
-    result = {}
-    for ticker in tickers:
-        try:
-            url = FIREANT_QUOTES_URL.format(symbol=ticker)
-            resp = requests.get(
-                url, headers=HEADERS, params={"offset": 0, "limit": 5}, timeout=REQUEST_TIMEOUT
-            )
-            if resp.status_code == 404:
-                if DEBUG_EMPTY_RESPONSES:
-                    print(f"FireAnt 404 for {ticker}: {_debug_snippet(resp)}")
-                else:
-                    print(f"FireAnt fetch failed for {ticker}: 404 Not Found")
-                continue
-            resp.raise_for_status()
-            data = resp.json()
-            rows = data if isinstance(data, list) else (data.get("data") or [])
-            if not rows:
-                if DEBUG_EMPTY_RESPONSES:
-                    print(f"FireAnt empty response for {ticker}: {_debug_snippet(resp)}")
-                continue
-            latest = rows[0]
-            prev = rows[1] if len(rows) >= 2 else None
-
-            close = _first_present(latest, ["PriceLast", "PriceClose", "priceClose", "ClosePrice", "close"])
-            if close is None:
-                if DEBUG_EMPTY_RESPONSES:
-                    print(f"FireAnt no recognized close field for {ticker}: keys={list(latest.keys())}")
-                continue
-            prev_close = _first_present(
-                prev, ["PriceLast", "PriceClose", "priceClose", "ClosePrice", "close"]
-            )
-            volume = _first_present(latest, ["TotalVolume", "Volume", "volume", "NmVolume"]) or 0
-
-            result[ticker] = {
-                "close": float(close),
-                "prev_close": float(prev_close) if prev_close else None,
-                "volume": int(volume),
-            }
-        except Exception as e:
-            print(f"FireAnt fetch failed for {ticker}: {e}")
-            continue
-    return result
-
-
-# --- Source 3: VNDirect --------------------------------------------------------
+# --- Source 2: VNDirect --------------------------------------------------------
 
 
 def _fetch_vndirect_rows(codes, days_back=15):
@@ -382,7 +336,6 @@ def fetch_vndirect_indices():
 
 STOCK_SOURCES = [
     ("CafeF", fetch_cafef_stock_prices),
-    ("FireAnt", fetch_fireant_stock_prices),
     ("VNDirect", fetch_vndirect_stock_prices),
 ]
 
