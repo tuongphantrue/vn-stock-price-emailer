@@ -27,7 +27,6 @@ jobs:
         env:
           WATCHLIST: ${{ vars.WATCHLIST }}
           ALERT_THRESHOLD_PERCENT: ${{ vars.ALERT_THRESHOLD_PERCENT }}
-          DISCREPANCY_THRESHOLD_PERCENT: ${{ vars.DISCREPANCY_THRESHOLD_PERCENT }}
         run: python vn_stock_price_emailer.py generate
 
       - name: Send email
@@ -41,6 +40,8 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add last_prices.json price_history.csv
+          for f in last_prices.json price_history.csv; do
+            [ -f "$f" ] && git add "$f"
+          done
           git diff --cached --quiet || git commit -m "Update price state [skip ci]"
           git push
