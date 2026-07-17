@@ -15,16 +15,28 @@ Data sources, tried in this order per ticker (first success wins for that
 ticker; sources are independent hosts, so a block on one doesn't take out
 the others):
 
-1. CafeF (s.cafef.vn) - public AJAX endpoint behind cafef.vn's own price
+1. Yahoo Finance (query1.finance.yahoo.com) - Vietnamese tickers are
+   available there under a .VN suffix (e.g. VNM.VN, VCB.VN) and VN-Index
+   under ^VNINDEX.VN. This is US-hosted infrastructure entirely separate
+   from Vietnam's domestic anti-scraping layers, and its chart API is
+   used from every kind of environment (including cloud CI) without the
+   IP-based blocking seen on the Vietnamese sources below. Prices are
+   already in plain VND, no thousand-scaling needed. HNX-Index and
+   UPCOM-Index don't have a confirmed Yahoo ticker, so those two fall
+   through to the sources below.
+2. CafeF (s.cafef.vn) - public AJAX endpoint behind cafef.vn's own price
    history pages. Field names verified against several independent
    scrapers using this exact endpoint over multiple years. Requires an
    X-Requested-With: XMLHttpRequest header - without it, the endpoint
-   returns HTTP 200 with an empty/error body instead of real data.
-2. VNDirect (finfo-api.vndirect.com.vn) - confirmed reachable and
+   returns HTTP 200 with an empty/error body instead of real data. Also
+   appears to reject requests from cloud/datacenter IP ranges (returns
+   the same empty/error body regardless of headers sent from GitHub
+   Actions), so treat this as a fallback rather than reliable from CI.
+3. VNDirect (finfo-api.vndirect.com.vn) - confirmed reachable and
    correctly-shaped in earlier testing, but times out entirely from
    GitHub Actions runners (Azure IP ranges appear to be blocked). Kept as
-   a fallback since it may work fine from a non-cloud IP (e.g. your own
-   machine, or a self-hosted runner), and costs nothing to try last.
+   a last-resort fallback since it may work fine from a non-cloud IP
+   (e.g. your own machine, or a self-hosted runner).
 
 (FireAnt was tried as a third source but dropped: its documented-looking
 endpoint 404s outright, and other people's write-ups of FireAnt's API note
@@ -109,6 +121,7 @@ INDICES = [
     ("UPCOMINDEX", "UPCOM-Index"),
 ]
 
+YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 CAFEF_HISTORY_URL = "https://s.cafef.vn/Ajax/PageNew/DataHistory/PriceHistory.ashx"
 VNDIRECT_QUOTES_URL = "https://finfo-api.vndirect.com.vn/v4/stock_prices"
 
@@ -175,7 +188,81 @@ def _first_present(d, keys):
     return None
 
 
-# --- Source 1: CafeF ----------------------------------------------------------
+# --- Source 1: Yahoo Finance ---------------------------------------------------
+
+
+def _fetch_yahoo_chart(symbol, days_back=10):
+    """Returns a list of (close, volume) pairs, oldest -> newest, for the
+    given Yahoo symbol (already including the .VN or ^...VN suffix),
+    skipping any entries where close is null (non-trading days Yahoo still
+    includes a slot for).
+    """
+    url = YAHOO_CHART_URL.format(symbol=symbol)
+    params = {"range": f"{days_back}d", "interval": "1d"}
+    resp = requests.get(url, headers=HEADERS, params=params, timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    data = resp.json()
+    chart = data.get("chart") or {}
+    results = chart.get("result") or []
+    if not results:
+        if DEBUG_EMPTY_RESPONSES:
+            print(f"Yahoo empty result for {symbol}: error={chart.get('error')}")
+        return []
+    result = results[0]
+    quote = ((result.get("indicators") or {}).get("quote") or [{}])[0]
+    closes = quote.get("close") or []
+    volumes = quote.get("volume") or []
+    pairs = [(c, volumes[i] if i < len(volumes) else None) for i, c in enumerate(closes) if c is not None]
+    return pairs
+
+
+def fetch_yahoo_stock_prices(tickers):
+    """Returns {ticker: {"close": VND, "prev_close": VND|None, "volume": int}}.
+    Yahoo already reports Vietnamese stock prices in plain VND (not
+    thousands), so no scaling is needed here, unlike CafeF/TCBS.
+    """
+    result = {}
+    for ticker in tickers:
+        try:
+            pairs = _fetch_yahoo_chart(f"{ticker}.VN")
+            if not pairs:
+                continue
+            latest_close, latest_vol = pairs[-1]
+            prev_close = pairs[-2][0] if len(pairs) >= 2 else None
+            result[ticker] = {
+                "close": float(latest_close),
+                "prev_close": float(prev_close) if prev_close is not None else None,
+                "volume": int(latest_vol or 0),
+            }
+        except Exception as e:
+            print(f"Yahoo Finance fetch failed for {ticker}: {e}")
+            continue
+    return result
+
+
+def fetch_yahoo_indices():
+    """Only VN-Index is confirmed available on Yahoo Finance under a stable
+    symbol (^VNINDEX.VN) - HNX-Index / UPCOM-Index don't have a confirmed
+    Yahoo ticker, so they're left for the CafeF/VNDirect fallback (the
+    merge-by-label logic in fetch_all_indices() already handles a source
+    covering only part of the index list).
+    """
+    result = {}
+    try:
+        pairs = _fetch_yahoo_chart("^VNINDEX.VN")
+        if pairs:
+            latest_close, _vol = pairs[-1]
+            prev_close = pairs[-2][0] if len(pairs) >= 2 else None
+            result["VN-Index"] = {
+                "close": float(latest_close),
+                "prev_close": float(prev_close) if prev_close is not None else None,
+            }
+    except Exception as e:
+        print(f"Yahoo Finance index fetch failed: {e}")
+    return result
+
+
+# --- Source 2: CafeF ----------------------------------------------------------
 
 
 def _fetch_cafef_history(symbol, page_size=5):
@@ -261,7 +348,7 @@ def fetch_cafef_indices():
     return result
 
 
-# --- Source 2: VNDirect --------------------------------------------------------
+# --- Source 3: VNDirect --------------------------------------------------------
 
 
 def _fetch_vndirect_rows(codes, days_back=15):
@@ -335,11 +422,13 @@ def fetch_vndirect_indices():
 # --- Cascade across sources ----------------------------------------------------
 
 STOCK_SOURCES = [
+    ("Yahoo Finance", fetch_yahoo_stock_prices),
     ("CafeF", fetch_cafef_stock_prices),
     ("VNDirect", fetch_vndirect_stock_prices),
 ]
 
 INDEX_SOURCES = [
+    ("Yahoo Finance", fetch_yahoo_indices),
     ("CafeF", fetch_cafef_indices),
     ("VNDirect", fetch_vndirect_indices),
 ]
