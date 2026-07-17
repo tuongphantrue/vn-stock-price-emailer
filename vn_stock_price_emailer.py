@@ -83,6 +83,7 @@ import smtplib
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 import requests
 
@@ -126,6 +127,7 @@ CAFEF_HISTORY_URL = "https://s.cafef.vn/Ajax/PageNew/DataHistory/PriceHistory.as
 VNDIRECT_QUOTES_URL = "https://finfo-api.vndirect.com.vn/v4/stock_prices"
 
 EMAIL_BODY_FILE = "email_body.txt"
+EMAIL_HTML_FILE = "email_body.html"
 STATE_FILE = "last_prices.json"
 HISTORY_FILE = "price_history.csv"
 
@@ -586,7 +588,7 @@ def gainers_losers_section(prices):
     return lines if (gainers or losers) else None
 
 
-# --- Formatting -------------------------------------------------------------
+# --- Formatting: plain text (fallback) --------------------------------------
 
 
 def format_email_body(prices, indices, used_source, previous_prices):
@@ -644,11 +646,227 @@ def format_email_body(prices, indices, used_source, previous_prices):
     return "\n".join(lines)
 
 
+# --- Formatting: HTML -----------------------------------------------------------
+
+_GREEN = "#16a34a"
+_GREEN_BG = "#ecfdf3"
+_RED = "#dc2626"
+_RED_BG = "#fef2f2"
+_GRAY = "#6b7280"
+_GRAY_BG = "#f3f4f6"
+_NAVY = "#0f172a"
+_BORDER = "#e5e7eb"
+
+
+def _pct_change(vals):
+    """Returns % change vs prev_close, or None if there's no prev_close."""
+    if vals.get("prev_close"):
+        return (vals["close"] - vals["prev_close"]) / vals["prev_close"] * 100
+    return None
+
+
+def _pct_style(pct):
+    """Returns (text_color, bg_color, arrow_char) for a % change value."""
+    if pct is None:
+        return (_GRAY, _GRAY_BG, "\u2013")  # en dash
+    if pct > 0:
+        return (_GREEN, _GREEN_BG, "\u25b2")  # ▲
+    if pct < 0:
+        return (_RED, _RED_BG, "\u25bc")  # ▼
+    return (_GRAY, _GRAY_BG, "\u25ac")  # ▬
+
+
+def _change_badge(pct):
+    """A small colored pill showing arrow + signed percentage."""
+    color, bg, arrow = _pct_style(pct)
+    text = f"{arrow} {pct:+.2f}%" if pct is not None else "\u2013"
+    return (
+        f'<span style="display:inline-block;padding:2px 8px;border-radius:999px;'
+        f'font-size:12px;font-weight:600;color:{color};background:{bg};">{text}</span>'
+    )
+
+
+def _html_escape(s):
+    return (
+        str(s)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def format_email_html(prices, indices, used_source, previous_prices):
+    parts = []
+    parts.append(f"""\
+<!DOCTYPE html>
+<html>
+<body style="margin:0;padding:0;background:#f1f5f9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f1f5f9;padding:24px 0;">
+<tr><td align="center">
+<table role="presentation" width="600" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,0.08);">
+
+<tr><td style="background:{_NAVY};padding:24px 28px;">
+  <div style="color:#ffffff;font-size:20px;font-weight:700;">VN Stock Watchlist</div>
+  <div style="color:#94a3b8;font-size:13px;margin-top:4px;">{now_vn().strftime('%A, %d %B %Y - %H:%M')} (Asia/Ho_Chi_Minh)</div>
+</td></tr>
+""")
+
+    # --- Market indices ---
+    if indices:
+        cells = []
+        for label, vals in indices.items():
+            pct = _pct_change(vals)
+            color, _bg, arrow = _pct_style(pct)
+            change_text = f"{arrow} {pct:+.2f}%" if pct is not None else "\u2013"
+            cells.append(f"""\
+<td width="33%" style="padding:14px 10px;text-align:center;border-right:1px solid {_BORDER};">
+  <div style="font-size:12px;color:{_GRAY};font-weight:600;text-transform:uppercase;letter-spacing:0.04em;">{_html_escape(label)}</div>
+  <div style="font-size:19px;font-weight:700;color:{_NAVY};margin-top:4px;">{vals['close']:,.2f}</div>
+  <div style="font-size:13px;font-weight:600;color:{color};margin-top:2px;">{change_text}</div>
+</td>""")
+        # strip trailing border on last cell
+        if cells:
+            cells[-1] = cells[-1].replace(f"border-right:1px solid {_BORDER};", "")
+        parts.append(f"""\
+<tr><td style="padding:20px 28px 4px 28px;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid {_BORDER};border-radius:8px;">
+    <tr>{''.join(cells)}</tr>
+  </table>
+</td></tr>
+""")
+
+    # --- Top movers ---
+    movers = gainers_losers_section(prices)
+    if movers:
+        changes = []
+        for ticker, vals in prices.items():
+            pct = _pct_change(vals)
+            if pct is not None:
+                changes.append((ticker, pct))
+        changes.sort(key=lambda t: t[1], reverse=True)
+        gainers = [c for c in changes if c[1] > 0][:3]
+        losers = sorted([c for c in changes if c[1] < 0][-3:], key=lambda t: t[1])
+
+        def _chip(ticker, pct):
+            color, bg, arrow = _pct_style(pct)
+            return (
+                f'<span style="display:inline-block;margin:3px 6px 3px 0;padding:4px 10px;'
+                f'border-radius:999px;background:{bg};color:{color};font-size:13px;font-weight:600;">'
+                f"{_html_escape(ticker)} {arrow} {pct:+.2f}%</span>"
+            )
+
+        rows = []
+        if gainers:
+            rows.append(
+                f'<div style="margin-bottom:6px;"><span style="font-size:12px;color:{_GRAY};font-weight:600;">GAINERS&nbsp;</span>'
+                + "".join(_chip(t, p) for t, p in gainers) + "</div>"
+            )
+        if losers:
+            rows.append(
+                f'<div><span style="font-size:12px;color:{_GRAY};font-weight:600;">LOSERS&nbsp;</span>'
+                + "".join(_chip(t, p) for t, p in losers) + "</div>"
+            )
+        parts.append(f"""\
+<tr><td style="padding:16px 28px 4px 28px;">
+  {''.join(rows)}
+</td></tr>
+""")
+
+    # --- Price table ---
+    row_html = []
+    for i, ticker in enumerate(WATCHLIST):
+        vals = prices.get(ticker)
+        stripe = "#ffffff" if i % 2 == 0 else "#f8fafc"
+        if not vals:
+            row_html.append(f"""\
+<tr style="background:{stripe};">
+  <td style="padding:10px 12px;font-weight:700;color:{_NAVY};">{_html_escape(ticker)}</td>
+  <td colspan="4" style="padding:10px 12px;color:{_GRAY};font-size:13px;">unavailable this run</td>
+</tr>""")
+            continue
+        pct = _pct_change(vals)
+        source = used_source.get(ticker, "?")
+        row_html.append(f"""\
+<tr style="background:{stripe};">
+  <td style="padding:10px 12px;font-weight:700;color:{_NAVY};">{_html_escape(ticker)}</td>
+  <td style="padding:10px 12px;text-align:right;font-variant-numeric:tabular-nums;color:{_NAVY};">{vals['close']:,.0f}</td>
+  <td style="padding:10px 12px;text-align:center;">{_change_badge(pct)}</td>
+  <td style="padding:10px 12px;text-align:right;color:{_GRAY};font-size:13px;font-variant-numeric:tabular-nums;">{vals.get('volume', 0):,.0f}</td>
+  <td style="padding:10px 12px;text-align:right;color:{_GRAY};font-size:11px;">{_html_escape(source)}</td>
+</tr>""")
+
+    parts.append(f"""\
+<tr><td style="padding:20px 28px 4px 28px;">
+  <div style="font-size:13px;font-weight:700;color:{_NAVY};text-transform:uppercase;letter-spacing:0.04em;margin-bottom:8px;">Closing Prices</div>
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid {_BORDER};border-radius:8px;overflow:hidden;font-size:14px;">
+    <tr style="background:#f8fafc;">
+      <th align="left" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Ticker</th>
+      <th align="right" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Close (VND)</th>
+      <th align="center" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Change</th>
+      <th align="right" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Volume</th>
+      <th align="right" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Source</th>
+    </tr>
+    {''.join(row_html)}
+  </table>
+</td></tr>
+""")
+
+    # --- Weekly trend ---
+    trend = weekly_trend_section()
+    if trend:
+        # trend[0] is a title line, trend[1] is a divider, rest are "TICKER  UP +x.xx% ..." lines
+        trend_rows = []
+        for line in trend[2:]:
+            ticker = line.split()[0]
+            vals_line = line[len(ticker):].strip()
+            is_up = "UP" in vals_line
+            is_down = "DOWN" in vals_line
+            color = _GREEN if is_up else (_RED if is_down else _GRAY)
+            trend_rows.append(
+                f'<div style="padding:4px 0;font-size:13px;">'
+                f'<span style="font-weight:700;color:{_NAVY};display:inline-block;width:56px;">{_html_escape(ticker)}</span>'
+                f'<span style="color:{color};font-weight:600;">{_html_escape(vals_line)}</span></div>'
+            )
+        parts.append(f"""\
+<tr><td style="padding:20px 28px 4px 28px;">
+  <div style="font-size:13px;font-weight:700;color:{_NAVY};text-transform:uppercase;letter-spacing:0.04em;margin-bottom:8px;">Weekly Trend (7-Day Change)</div>
+  {''.join(trend_rows)}
+</td></tr>
+""")
+
+    # --- Footer ---
+    sources_used = sorted(set(used_source.values()))
+    sources_line = f"Sources this run: {_html_escape(', '.join(sources_used))}" if sources_used else ""
+    parts.append(f"""\
+<tr><td style="padding:20px 28px 28px 28px;">
+  <div style="border-top:1px solid {_BORDER};padding-top:14px;font-size:11px;color:#9ca3af;line-height:1.5;">
+    {sources_line}<br>
+    These are public feeds behind each provider's own app, not documented/guaranteed APIs.
+    Verify against your broker before trading on them.
+  </div>
+</td></tr>
+
+</table>
+</td></tr>
+</table>
+</body>
+</html>
+""")
+
+    return "".join(parts)
+
+
 # --- Email --------------------------------------------------------------------
 
 
-def send_email(body):
-    msg = MIMEText(body)
+def send_email(text_body, html_body=None):
+    if html_body:
+        msg = MIMEMultipart("alternative")
+        msg.attach(MIMEText(text_body, "plain"))
+        msg.attach(MIMEText(html_body, "html"))
+    else:
+        msg = MIMEText(text_body)
+
     msg["Subject"] = f"VN Stock Watchlist - {now_vn().strftime('%Y-%m-%d %H:%M')}"
     msg["From"] = GMAIL_ADDRESS
     msg["To"] = STOCK_RECIPIENT
@@ -668,6 +886,7 @@ def cmd_generate():
     if not prices:
         print("No prices fetched from any source, aborting this run.")
         open(EMAIL_BODY_FILE, "w").close()
+        open(EMAIL_HTML_FILE, "w").close()
         return
 
     previous_prices = load_previous_prices()
@@ -675,6 +894,7 @@ def cmd_generate():
     if not should_send(prices, previous_prices):
         print("No significant change, skipping email.")
         open(EMAIL_BODY_FILE, "w").close()
+        open(EMAIL_HTML_FILE, "w").close()
         return
 
     try:
@@ -684,8 +904,11 @@ def cmd_generate():
         indices = {}
 
     body = format_email_body(prices, indices, used_source, previous_prices)
+    html = format_email_html(prices, indices, used_source, previous_prices)
     with open(EMAIL_BODY_FILE, "w") as f:
         f.write(body)
+    with open(EMAIL_HTML_FILE, "w") as f:
+        f.write(html)
 
     print(body)
     save_prices(prices)
@@ -704,11 +927,16 @@ def cmd_send():
         print("Email body empty, nothing to send.")
         return
 
+    html = None
+    if os.path.exists(EMAIL_HTML_FILE):
+        with open(EMAIL_HTML_FILE) as f:
+            html = f.read().strip() or None
+
     if not (GMAIL_ADDRESS and GMAIL_APP_PASSWORD and STOCK_RECIPIENT):
         print("GMAIL_ADDRESS / GMAIL_APP_PASSWORD / STOCK_RECIPIENT not set, skipping send.")
         return
 
-    send_email(body)
+    send_email(body, html)
     print("Email sent.")
 
 
