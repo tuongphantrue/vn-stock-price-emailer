@@ -137,7 +137,25 @@ HEADERS = {
     ),
     "Accept": "application/json",
 }
+# CafeF's AJAX endpoint is called from cafef.vn pages via XHR in the browser;
+# it may check Referer/Origin (common hotlink-protection) and silently return
+# an empty result set to requests that don't look like they came from the
+# site itself, rather than an HTTP error. Send matching headers to look like
+# a real page load.
+CAFEF_HEADERS = dict(HEADERS, Referer="https://cafef.vn/", Origin="https://cafef.vn")
 REQUEST_TIMEOUT = 15
+DEBUG_EMPTY_RESPONSES = _env("DEBUG_EMPTY_RESPONSES") is not None
+
+
+def _debug_snippet(resp):
+    """Best-effort short debug string for a response that came back with no
+    usable rows: status code + first ~150 chars of body. Helps tell apart
+    'blocked and served an HTML/captcha page' from 'valid JSON, just empty'.
+    """
+    try:
+        return f"status={resp.status_code} body[:150]={resp.text[:150]!r}"
+    except Exception:
+        return "status=? body=?"
 
 
 def _first_present(d, keys):
@@ -164,10 +182,15 @@ def _fetch_cafef_history(symbol, page_size=5):
         "PageIndex": 1,
         "PageSize": page_size,
     }
-    resp = requests.get(CAFEF_HISTORY_URL, headers=HEADERS, params=params, timeout=REQUEST_TIMEOUT)
+    resp = requests.get(
+        CAFEF_HISTORY_URL, headers=CAFEF_HEADERS, params=params, timeout=REQUEST_TIMEOUT
+    )
     resp.raise_for_status()
     data = resp.json()
     rows = ((data.get("Data") or {}).get("Data")) or []
+
+    if not rows and DEBUG_EMPTY_RESPONSES:
+        print(f"CafeF empty response for {symbol}: {_debug_snippet(resp)}")
 
     def _row_date(row):
         try:
@@ -247,16 +270,26 @@ def fetch_fireant_stock_prices(tickers):
             resp = requests.get(
                 url, headers=HEADERS, params={"offset": 0, "limit": 5}, timeout=REQUEST_TIMEOUT
             )
+            if resp.status_code == 404:
+                if DEBUG_EMPTY_RESPONSES:
+                    print(f"FireAnt 404 for {ticker}: {_debug_snippet(resp)}")
+                else:
+                    print(f"FireAnt fetch failed for {ticker}: 404 Not Found")
+                continue
             resp.raise_for_status()
             data = resp.json()
             rows = data if isinstance(data, list) else (data.get("data") or [])
             if not rows:
+                if DEBUG_EMPTY_RESPONSES:
+                    print(f"FireAnt empty response for {ticker}: {_debug_snippet(resp)}")
                 continue
             latest = rows[0]
             prev = rows[1] if len(rows) >= 2 else None
 
             close = _first_present(latest, ["PriceLast", "PriceClose", "priceClose", "ClosePrice", "close"])
             if close is None:
+                if DEBUG_EMPTY_RESPONSES:
+                    print(f"FireAnt no recognized close field for {ticker}: keys={list(latest.keys())}")
                 continue
             prev_close = _first_present(
                 prev, ["PriceLast", "PriceClose", "priceClose", "ClosePrice", "close"]
