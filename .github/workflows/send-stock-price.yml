@@ -1,0 +1,46 @@
+name: Send VN stock price email
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  send-email:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate email body
+        env:
+          WATCHLIST: ${{ vars.WATCHLIST }}
+          ALERT_THRESHOLD_PERCENT: ${{ vars.ALERT_THRESHOLD_PERCENT }}
+          DISCREPANCY_THRESHOLD_PERCENT: ${{ vars.DISCREPANCY_THRESHOLD_PERCENT }}
+        run: python vn_stock_price_emailer.py generate
+
+      - name: Send email
+        env:
+          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          STOCK_RECIPIENT: ${{ secrets.STOCK_RECIPIENT }}
+        run: python vn_stock_price_emailer.py send
+
+      - name: Commit updated state/history files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add last_prices.json price_history.csv
+          git diff --cached --quiet || git commit -m "Update price state [skip ci]"
+          git push
