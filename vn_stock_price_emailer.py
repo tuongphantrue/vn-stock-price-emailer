@@ -69,8 +69,12 @@ Extra features (matching the sibling emailers):
   can tell at a glance if one of the three has gone dark
 
 Usage:
-    python vn_stock_price_emailer.py generate   # fetch prices, build email body -> email_body.txt
-    python vn_stock_price_emailer.py send       # send email_body.txt via SMTP
+    python vn_stock_price_emailer.py generate      # fetch prices, build email body -> email_body.txt
+    python vn_stock_price_emailer.py send          # send email_body.txt via SMTP
+    python vn_stock_price_emailer.py test-sources  # diagnostic: test each source independently,
+                                                    # bypassing the "only call what's still missing"
+                                                    # cascade logic so a redundant source still gets
+                                                    # exercised and you can see if it still works
 
 Required environment variables (set as GitHub Actions secrets, or export locally):
     GMAIL_ADDRESS       - sender gmail address
@@ -1050,11 +1054,58 @@ def cmd_send():
     print("Email sent.")
 
 
+def cmd_test_sources():
+    """Diagnostic mode: calls every stock/index source directly and
+    independently for the full watchlist, regardless of whether an earlier
+    source in the cascade already covered a given ticker. The normal
+    'generate' run only calls a source for gaps the previous ones left, so
+    a source that's fully redundant on a given day (e.g. Yahoo covering
+    everything) never actually gets exercised - this bypasses that so you
+    can confirm each source still works on its own.
+    """
+    print(f"Testing {len(STOCK_SOURCES)} stock source(s) against {len(WATCHLIST)} ticker(s): {', '.join(WATCHLIST)}\n")
+
+    for name, fetch_fn in STOCK_SOURCES:
+        try:
+            result = fetch_fn(list(WATCHLIST))
+        except Exception as e:
+            print(f"{name}: FAILED ENTIRELY - {e}")
+            continue
+        hits = [t for t in WATCHLIST if t in result]
+        misses = [t for t in WATCHLIST if t not in result]
+        print(f"{name}: {len(hits)}/{len(WATCHLIST)} tickers returned")
+        if hits:
+            sample = hits[0]
+            print(f"  sample: {sample} -> {result[sample]}")
+        if misses:
+            print(f"  missing: {', '.join(misses)}")
+        print()
+
+    print(f"Testing {len(INDEX_SOURCES)} index source(s) against {len(INDICES)} index(es)\n")
+    index_labels = [label for _code, label in INDICES]
+    for name, fetch_fn in INDEX_SOURCES:
+        try:
+            result = fetch_fn()
+        except Exception as e:
+            print(f"{name}: FAILED ENTIRELY - {e}")
+            continue
+        hits = [label for label in index_labels if label in result]
+        misses = [label for label in index_labels if label not in result]
+        print(f"{name}: {len(hits)}/{len(index_labels)} indices returned")
+        for label in hits:
+            print(f"  {label}: {result[label]}")
+        if misses:
+            print(f"  missing: {', '.join(misses)}")
+        print()
+
+
 if __name__ == "__main__":
     command = sys.argv[1] if len(sys.argv) > 1 else "generate"
     if command == "generate":
         cmd_generate()
     elif command == "send":
         cmd_send()
+    elif command == "test-sources":
+        cmd_test_sources()
     else:
-        print(f"Unknown command: {command}. Use 'generate' or 'send'.")
+        print(f"Unknown command: {command}. Use 'generate', 'send', or 'test-sources'.")
