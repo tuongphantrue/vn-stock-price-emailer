@@ -128,7 +128,22 @@ def format_vn_datetime(dt):
 
 
 DEFAULT_WATCHLIST = [
-    "VNM", "VIC", "VHM", "HPG", "FPT", "MWG", "VCB", "TCB", "MBB", "SSI",
+    # Banking
+    "VCB", "TCB", "MBB", "BID", "CTG", "ACB", "VPB",
+    # Real estate
+    "VIC", "VHM", "NVL", "KDH",
+    # Retail / consumer
+    "MWG", "PNJ", "VNM", "SAB",
+    # Industrials / materials
+    "HPG", "GVR", "DGC",
+    # Technology
+    "FPT",
+    # Securities
+    "SSI",
+    # Energy / utilities
+    "GAS", "PLX", "POW",
+    # Aviation
+    "VJC",
 ]
 
 
