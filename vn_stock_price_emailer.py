@@ -29,9 +29,11 @@ the others):
    usage examples (one of its own examples successfully queries a
    Vietnamese ticker, HOSE:VIX, in the same batched call as US tickers).
    Also globally-hosted infrastructure, same category as Yahoo above.
-   Assumes HOSE listing for stock tickers (true for the default
-   watchlist) - a ticker on another exchange just comes back empty here
-   and falls through to the next source rather than erroring.
+   Each ticker is qualified with its actual exchange (HOSE/HNX/UPCOM) via
+   TICKER_EXCHANGE - a ticker this script doesn't have an exchange
+   mapping for defaults to HOSE and, if that guess is wrong, just comes
+   back empty here and falls through to the next source rather than
+   erroring.
 3. CafeF (s.cafef.vn) - public AJAX endpoint behind cafef.vn's own price
    history pages. Field names verified against several independent
    scrapers using this exact endpoint over multiple years. Requires an
@@ -127,24 +129,65 @@ def format_vn_datetime(dt):
     return f"{weekday}, {dt.day:02d} {month} {dt.year} - {dt.strftime('%H:%M')}"
 
 
+DEFAULT_WATCHLIST_BY_EXCHANGE = {
+    "HOSE": [
+        # Banking
+        "VCB", "TCB", "MBB", "BID", "CTG", "ACB", "VPB",
+        # Real estate
+        "VIC", "VHM", "NVL", "KDH",
+        # Retail / consumer
+        "MWG", "PNJ", "VNM", "SAB",
+        # Industrials / materials
+        "HPG", "GVR", "DGC",
+        # Technology
+        "FPT",
+        # Securities
+        "SSI",
+        # Energy / utilities
+        "GAS", "PLX", "POW",
+        # Aviation
+        "VJC",
+    ],
+    "HNX": [
+        "SHS",  # Saigon-Hanoi Securities
+        "PVS",  # PetroVietnam Technical Services
+        "IDC",  # IDICO Corp
+        "VCS",  # Vicostone
+        "CEO",  # CEO Group
+        "NTP",  # Tien Phong Plastic
+    ],
+    "UPCOM": [
+        "BSR",  # Binh Son Refining
+        "ACV",  # Airports Corporation of Vietnam
+        "VEA",  # VEAM Corporation
+        "MCH",  # Masan Consumer Holdings
+        "QNS",  # Quang Ngai Sugar
+    ],
+}
+
+# Exchange order used consistently for display grouping throughout the email.
+EXCHANGE_ORDER = ["HOSE", "HNX", "UPCOM"]
+
 DEFAULT_WATCHLIST = [
-    # Banking
-    "VCB", "TCB", "MBB", "BID", "CTG", "ACB", "VPB",
-    # Real estate
-    "VIC", "VHM", "NVL", "KDH",
-    # Retail / consumer
-    "MWG", "PNJ", "VNM", "SAB",
-    # Industrials / materials
-    "HPG", "GVR", "DGC",
-    # Technology
-    "FPT",
-    # Securities
-    "SSI",
-    # Energy / utilities
-    "GAS", "PLX", "POW",
-    # Aviation
-    "VJC",
+    t for exch in EXCHANGE_ORDER for t in DEFAULT_WATCHLIST_BY_EXCHANGE[exch]
 ]
+
+# ticker -> exchange, built from the same source of truth as the default
+# watchlist above. A custom ticker added via the WATCHLIST env var that
+# isn't in this map falls back to "HOSE" (see ticker_exchange() below) -
+# true for the large majority of actively-traded VN tickers, but worth
+# double-checking if you add an HNX/UPCOM-only name yourself.
+TICKER_EXCHANGE = {
+    t: exch for exch, tickers in DEFAULT_WATCHLIST_BY_EXCHANGE.items() for t in tickers
+}
+
+
+def ticker_exchange(ticker):
+    """Returns the exchange ("HOSE"/"HNX"/"UPCOM") for a ticker, defaulting
+    to HOSE for anything not in TICKER_EXCHANGE (i.e. a custom addition via
+    the WATCHLIST env var that this script doesn't already know about).
+    """
+    return TICKER_EXCHANGE.get(ticker, "HOSE")
 
 
 def _env(name, default=None):
@@ -160,6 +203,17 @@ def _env(name, default=None):
 
 WATCHLIST = _env("WATCHLIST", ",".join(DEFAULT_WATCHLIST)).split(",")
 WATCHLIST = [t.strip().upper() for t in WATCHLIST if t.strip()]
+
+
+def watchlist_by_exchange():
+    """Groups WATCHLIST tickers by exchange, in EXCHANGE_ORDER, skipping
+    exchanges with no tickers. Used to render the email's price table as
+    separate per-exchange sections instead of one flat list.
+    """
+    groups = {exch: [] for exch in EXCHANGE_ORDER}
+    for ticker in WATCHLIST:
+        groups[ticker_exchange(ticker)].append(ticker)
+    return {exch: tickers for exch, tickers in groups.items() if tickers}
 
 INDICES = [
     ("VNINDEX", "VN-Index"),
@@ -349,13 +403,14 @@ def _tradingview_prev_close(close, change_pct):
 
 def fetch_tradingview_stock_prices(tickers):
     """Returns {ticker: {"close": VND, "prev_close": VND|None, "volume": int}}.
-    Assumes HOSE listing, which covers the default large-cap watchlist. A
-    ticker actually listed on HNX/UPCOM will simply come back with no data
-    here (not an error) and fall through to the next source instead.
+    Each ticker is qualified with its actual exchange (HOSE/HNX/UPCOM) via
+    ticker_exchange() rather than assuming HOSE for everything - a wrong
+    guess here would previously have silently returned nothing for any
+    HNX/UPCOM ticker.
     """
     result = {}
     try:
-        qualified = [f"HOSE:{t}" for t in tickers]
+        qualified = [f"{ticker_exchange(t)}:{t}" for t in tickers]
         rows = _tradingview_scan(qualified, ["close", "change", "volume"])
     except Exception as e:
         print(f"TradingView fetch failed entirely: {e}")
@@ -773,20 +828,22 @@ def format_email_body(prices, indices, used_source, previous_prices):
             lines.append("Giảm: " + ", ".join(f"{t} {p:+.2f}%" for t, p in losers))
         lines.append("")
 
-    lines.append("Giá đóng cửa")
-    lines.append(f"{'Mã CK':<8}{'Giá đóng cửa (VNĐ)':<22}{'Thay đổi':<14}{'Khối lượng':<16}{'Nguồn'}")
-    lines.append("-" * 68)
-    for ticker in WATCHLIST:
-        vals = prices.get(ticker)
-        if not vals:
-            lines.append(f"{ticker:<8}không có dữ liệu lần này")
-            continue
-        pct = _pct_change(vals)
-        change_str = f"{_pct_arrow_word(pct)} {pct:+.2f}%" if pct is not None else ""
-        lines.append(
-            f"{ticker:<8}{vals['close']:,.0f}{'':<12}{change_str:<14}"
-            f"{vals.get('volume', 0):,.0f}{'':<10}{used_source.get(ticker, '?')}"
-        )
+    for exch, tickers in watchlist_by_exchange().items():
+        lines.append(f"Giá đóng cửa - {exch}")
+        lines.append(f"{'Mã CK':<8}{'Giá đóng cửa (VNĐ)':<22}{'Thay đổi':<14}{'Khối lượng':<16}{'Nguồn'}")
+        lines.append("-" * 68)
+        for ticker in tickers:
+            vals = prices.get(ticker)
+            if not vals:
+                lines.append(f"{ticker:<8}không có dữ liệu lần này")
+                continue
+            pct = _pct_change(vals)
+            change_str = f"{_pct_arrow_word(pct)} {pct:+.2f}%" if pct is not None else ""
+            lines.append(
+                f"{ticker:<8}{vals['close']:,.0f}{'':<12}{change_str:<14}"
+                f"{vals.get('volume', 0):,.0f}{'':<10}{used_source.get(ticker, '?')}"
+            )
+        lines.append("")
 
     trend = weekly_trend_data()
     if trend:
@@ -920,21 +977,23 @@ def format_email_html(prices, indices, used_source, previous_prices):
 </td></tr>
 """)
 
-    # --- Price table ---
-    row_html = []
-    for i, ticker in enumerate(WATCHLIST):
-        vals = prices.get(ticker)
-        stripe = "#ffffff" if i % 2 == 0 else "#f8fafc"
-        if not vals:
-            row_html.append(f"""\
+    # --- Price table, grouped by exchange ---
+    exchange_sections = []
+    for exch, tickers in watchlist_by_exchange().items():
+        row_html = []
+        for i, ticker in enumerate(tickers):
+            vals = prices.get(ticker)
+            stripe = "#ffffff" if i % 2 == 0 else "#f8fafc"
+            if not vals:
+                row_html.append(f"""\
 <tr style="background:{stripe};">
   <td style="padding:10px 12px;font-weight:700;color:{_NAVY};">{_html_escape(ticker)}</td>
   <td colspan="4" style="padding:10px 12px;color:{_GRAY};font-size:13px;">không có dữ liệu lần này</td>
 </tr>""")
-            continue
-        pct = _pct_change(vals)
-        source = used_source.get(ticker, "?")
-        row_html.append(f"""\
+                continue
+            pct = _pct_change(vals)
+            source = used_source.get(ticker, "?")
+            row_html.append(f"""\
 <tr style="background:{stripe};">
   <td style="padding:10px 12px;font-weight:700;color:{_NAVY};">{_html_escape(ticker)}</td>
   <td style="padding:10px 12px;text-align:right;font-variant-numeric:tabular-nums;color:{_NAVY};">{vals['close']:,.0f}</td>
@@ -943,9 +1002,11 @@ def format_email_html(prices, indices, used_source, previous_prices):
   <td style="padding:10px 12px;text-align:right;color:{_GRAY};font-size:11px;">{_html_escape(source)}</td>
 </tr>""")
 
-    parts.append(f"""\
-<tr><td style="padding:20px 28px 4px 28px;">
-  <div style="font-size:13px;font-weight:700;color:{_NAVY};text-transform:uppercase;letter-spacing:0.04em;margin-bottom:8px;">Giá Đóng Cửa</div>
+        exchange_sections.append(f"""\
+  <div style="margin:16px 0 8px 0;">
+    <span style="display:inline-block;padding:2px 9px;border-radius:5px;background:{_NAVY};color:#ffffff;font-size:11px;font-weight:700;letter-spacing:0.04em;">{exch}</span>
+    <span style="font-size:12px;color:{_GRAY};margin-left:6px;">{len(tickers)} mã</span>
+  </div>
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid {_BORDER};border-radius:8px;overflow:hidden;font-size:14px;">
     <tr style="background:#f8fafc;">
       <th align="left" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Mã CK</th>
@@ -955,7 +1016,12 @@ def format_email_html(prices, indices, used_source, previous_prices):
       <th align="right" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Nguồn</th>
     </tr>
     {''.join(row_html)}
-  </table>
+  </table>""")
+
+    parts.append(f"""\
+<tr><td style="padding:20px 28px 4px 28px;">
+  <div style="font-size:13px;font-weight:700;color:{_NAVY};text-transform:uppercase;letter-spacing:0.04em;">Giá Đóng Cửa</div>
+  {''.join(exchange_sections)}
 </td></tr>
 """)
 
