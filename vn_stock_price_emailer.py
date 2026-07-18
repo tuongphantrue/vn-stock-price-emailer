@@ -109,6 +109,24 @@ def now_vn():
     return datetime.now(VN_TZ)
 
 
+_VN_WEEKDAYS = ["Thứ Hai", "Thứ Ba", "Thứ Tư", "Thứ Năm", "Thứ Sáu", "Thứ Bảy", "Chủ Nhật"]
+_VN_MONTHS = [
+    "Tháng 1", "Tháng 2", "Tháng 3", "Tháng 4", "Tháng 5", "Tháng 6",
+    "Tháng 7", "Tháng 8", "Tháng 9", "Tháng 10", "Tháng 11", "Tháng 12",
+]
+
+
+def format_vn_datetime(dt):
+    """Vietnamese weekday/month names, formatted by hand rather than via
+    strftime('%A, %B') - GitHub Actions runners don't have the vi_VN
+    locale installed by default, so a locale-based approach would
+    silently fall back to English instead of erroring.
+    """
+    weekday = _VN_WEEKDAYS[dt.weekday()]
+    month = _VN_MONTHS[dt.month - 1]
+    return f"{weekday}, {dt.day:02d} {month} {dt.year} - {dt.strftime('%H:%M')}"
+
+
 DEFAULT_WATCHLIST = [
     "VNM", "VIC", "VHM", "HPG", "FPT", "MWG", "VCB", "TCB", "MBB", "SSI",
 ]
@@ -632,10 +650,13 @@ def append_history(prices):
             writer.writerow([ts, ticker, vals["close"]])
 
 
-def weekly_trend_section():
+def weekly_trend_data():
     """Once a week (first run after midnight Monday, Vietnam time), compares
-    today's close to the close from ~7 days ago and returns a summary section,
-    or None if it's not time yet / there's not enough history.
+    today's close to the close from ~7 days ago. Returns a list of
+    (ticker, pct_change) tuples, or None if it's not time yet / there's not
+    enough history. Returning raw data (rather than pre-formatted strings)
+    keeps this reusable for both the plain-text and HTML renderers without
+    one having to parse the other's output.
     """
     vn_now = now_vn()
     is_weekly_slot = vn_now.weekday() == 0 and vn_now.hour == 0  # Monday, 00:xx
@@ -661,100 +682,113 @@ def weekly_trend_section():
             if ts <= cutoff and (ticker not in oldest_near_cutoff or ts > oldest_near_cutoff[ticker][0]):
                 oldest_near_cutoff[ticker] = (ts, close)
 
-    lines = []
+    result = []
     for ticker in WATCHLIST:
         if ticker in latest and ticker in oldest_near_cutoff:
             _, old_close = oldest_near_cutoff[ticker]
             _, new_close = latest[ticker]
             pct = (new_close - old_close) / old_close * 100
-            arrow = "UP" if pct > 0 else ("DOWN" if pct < 0 else "FLAT")
-            lines.append(f"{ticker:<8}{arrow} {pct:+.2f}% over the past week")
+            result.append((ticker, pct))
 
-    if not lines:
-        return None  # not enough history yet (less than a week of data)
-
-    return ["Weekly trend (7-day change)"] + ["-" * 42] + lines
+    return result if result else None  # None = not enough history yet
 
 
 # --- Gainers / losers ---------------------------------------------------------
 
 
-def gainers_losers_section(prices):
-    """Top 3 gainers and top 3 losers in the watchlist by daily % change."""
+def top_movers(prices):
+    """Returns (gainers, losers) as lists of (ticker, pct) tuples, top 3
+    each by daily % change, or (None, None) if there's nothing to compare.
+    """
     changes = []
     for ticker, vals in prices.items():
-        if vals.get("prev_close"):
-            pct = (vals["close"] - vals["prev_close"]) / vals["prev_close"] * 100
+        pct = _pct_change(vals)
+        if pct is not None:
             changes.append((ticker, pct))
     if not changes:
-        return None
+        return None, None
 
     changes.sort(key=lambda t: t[1], reverse=True)
     gainers = [c for c in changes if c[1] > 0][:3]
-    losers = [c for c in changes if c[1] < 0][-3:]
+    losers = sorted([c for c in changes if c[1] < 0][-3:], key=lambda t: t[1])
+    return gainers, losers
 
-    lines = ["Top movers"]
-    lines.append("-" * 42)
-    if gainers:
-        lines.append("Gainers: " + ", ".join(f"{t} {p:+.2f}%" for t, p in gainers))
-    if losers:
-        lines.append("Losers:  " + ", ".join(f"{t} {p:+.2f}%" for t, p in sorted(losers, key=lambda t: t[1])))
-    return lines if (gainers or losers) else None
+
+def _pct_change(vals):
+    """Returns % change vs prev_close, or None if there's no prev_close."""
+    if vals.get("prev_close"):
+        return (vals["close"] - vals["prev_close"]) / vals["prev_close"] * 100
+    return None
+
+
+def _pct_arrow_word(pct):
+    """Vietnamese text label for a % change, used in the plain-text email."""
+    if pct is None:
+        return "\u2013"
+    if pct > 0:
+        return "TĂNG"
+    if pct < 0:
+        return "GIẢM"
+    return "ĐI NGANG"
 
 
 # --- Formatting: plain text (fallback) --------------------------------------
 
 
 def format_email_body(prices, indices, used_source, previous_prices):
-    lines = [f"Vietnam stock watchlist - {now_vn().strftime('%Y-%m-%d %H:%M')} (Asia/Ho_Chi_Minh)\n"]
+    lines = [f"Danh mục cổ phiếu Việt Nam - {format_vn_datetime(now_vn())} (Giờ Việt Nam)\n"]
 
     if indices:
-        lines.append("Market indices")
-        lines.append(f"{'Index':<14}{'Points':<14}{'Change'}")
+        lines.append("Chỉ số thị trường")
+        lines.append(f"{'Chỉ số':<14}{'Điểm':<14}{'Thay đổi'}")
         lines.append("-" * 42)
         for label, vals in indices.items():
-            change_str = ""
-            if vals.get("prev_close"):
-                pct = (vals["close"] - vals["prev_close"]) / vals["prev_close"] * 100
-                arrow = "UP" if pct > 0 else ("DOWN" if pct < 0 else "FLAT")
-                change_str = f"{arrow} {pct:+.2f}%"
+            pct = _pct_change(vals)
+            change_str = f"{_pct_arrow_word(pct)} {pct:+.2f}%" if pct is not None else ""
             lines.append(f"{label:<14}{vals['close']:,.2f}{'':<6}{change_str}")
         lines.append("")
 
-    movers = gainers_losers_section(prices)
-    if movers:
-        lines += movers + [""]
+    gainers, losers = top_movers(prices)
+    if gainers or losers:
+        lines.append("Biến động nổi bật")
+        lines.append("-" * 42)
+        if gainers:
+            lines.append("Tăng: " + ", ".join(f"{t} {p:+.2f}%" for t, p in gainers))
+        if losers:
+            lines.append("Giảm: " + ", ".join(f"{t} {p:+.2f}%" for t, p in losers))
+        lines.append("")
 
-    lines.append("Closing prices")
-    lines.append(f"{'Ticker':<8}{'Close (VND)':<16}{'Change':<14}{'Volume':<14}{'Source'}")
-    lines.append("-" * 60)
+    lines.append("Giá đóng cửa")
+    lines.append(f"{'Mã CK':<8}{'Giá đóng cửa (VNĐ)':<22}{'Thay đổi':<14}{'Khối lượng':<16}{'Nguồn'}")
+    lines.append("-" * 68)
     for ticker in WATCHLIST:
         vals = prices.get(ticker)
         if not vals:
-            lines.append(f"{ticker:<8}unavailable this run (all sources failed)")
+            lines.append(f"{ticker:<8}không có dữ liệu lần này")
             continue
-        change_str = ""
-        if vals.get("prev_close"):
-            pct = (vals["close"] - vals["prev_close"]) / vals["prev_close"] * 100
-            arrow = "UP" if pct > 0 else ("DOWN" if pct < 0 else "FLAT")
-            change_str = f"{arrow} {pct:+.2f}%"
+        pct = _pct_change(vals)
+        change_str = f"{_pct_arrow_word(pct)} {pct:+.2f}%" if pct is not None else ""
         lines.append(
-            f"{ticker:<8}{vals['close']:,.0f}{'':<6}{change_str:<14}"
-            f"{vals.get('volume', 0):,.0f}{'':<8}{used_source.get(ticker, '?')}"
+            f"{ticker:<8}{vals['close']:,.0f}{'':<12}{change_str:<14}"
+            f"{vals.get('volume', 0):,.0f}{'':<10}{used_source.get(ticker, '?')}"
         )
 
-    trend = weekly_trend_section()
+    trend = weekly_trend_data()
     if trend:
         lines.append("")
-        lines += trend
+        lines.append("Xu hướng tuần (thay đổi 7 ngày)")
+        lines.append("-" * 42)
+        for ticker, pct in trend:
+            lines.append(f"{ticker:<8}{_pct_arrow_word(pct)} {pct:+.2f}% trong tuần qua")
 
     sources_used = sorted(set(used_source.values()))
     lines.append("")
     if sources_used:
-        lines.append(f"Sources that supplied data this run: {', '.join(sources_used)}")
+        lines.append(f"Nguồn dữ liệu lần này: {', '.join(sources_used)}")
     lines.append(
-        "Note: these are public feeds behind each provider's own app, not documented/"
-        "guaranteed APIs. Verify against your broker before trading on them."
+        "Lưu ý: đây là các nguồn dữ liệu công khai từ ứng dụng của từng nhà cung cấp, "
+        "không phải API chính thức/được đảm bảo. Vui lòng kiểm tra lại với công ty "
+        "chứng khoán của bạn trước khi giao dịch dựa trên các số liệu này."
     )
 
     return "\n".join(lines)
@@ -770,13 +804,6 @@ _GRAY = "#6b7280"
 _GRAY_BG = "#f3f4f6"
 _NAVY = "#0f172a"
 _BORDER = "#e5e7eb"
-
-
-def _pct_change(vals):
-    """Returns % change vs prev_close, or None if there's no prev_close."""
-    if vals.get("prev_close"):
-        return (vals["close"] - vals["prev_close"]) / vals["prev_close"] * 100
-    return None
 
 
 def _pct_style(pct):
@@ -813,15 +840,16 @@ def format_email_html(prices, indices, used_source, previous_prices):
     parts = []
     parts.append(f"""\
 <!DOCTYPE html>
-<html>
+<html lang="vi">
+<head><meta charset="utf-8"></head>
 <body style="margin:0;padding:0;background:#f1f5f9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f1f5f9;padding:24px 0;">
 <tr><td align="center">
 <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,0.08);">
 
 <tr><td style="background:{_NAVY};padding:24px 28px;">
-  <div style="color:#ffffff;font-size:20px;font-weight:700;">VN Stock Watchlist</div>
-  <div style="color:#94a3b8;font-size:13px;margin-top:4px;">{now_vn().strftime('%A, %d %B %Y - %H:%M')} (Asia/Ho_Chi_Minh)</div>
+  <div style="color:#ffffff;font-size:20px;font-weight:700;">Danh Mục Cổ Phiếu Việt Nam</div>
+  <div style="color:#94a3b8;font-size:13px;margin-top:4px;">{format_vn_datetime(now_vn())} (Giờ Việt Nam)</div>
 </td></tr>
 """)
 
@@ -850,17 +878,8 @@ def format_email_html(prices, indices, used_source, previous_prices):
 """)
 
     # --- Top movers ---
-    movers = gainers_losers_section(prices)
-    if movers:
-        changes = []
-        for ticker, vals in prices.items():
-            pct = _pct_change(vals)
-            if pct is not None:
-                changes.append((ticker, pct))
-        changes.sort(key=lambda t: t[1], reverse=True)
-        gainers = [c for c in changes if c[1] > 0][:3]
-        losers = sorted([c for c in changes if c[1] < 0][-3:], key=lambda t: t[1])
-
+    gainers, losers = top_movers(prices)
+    if gainers or losers:
         def _chip(ticker, pct):
             color, bg, arrow = _pct_style(pct)
             return (
@@ -872,12 +891,12 @@ def format_email_html(prices, indices, used_source, previous_prices):
         rows = []
         if gainers:
             rows.append(
-                f'<div style="margin-bottom:6px;"><span style="font-size:12px;color:{_GRAY};font-weight:600;">GAINERS&nbsp;</span>'
+                f'<div style="margin-bottom:6px;"><span style="font-size:12px;color:{_GRAY};font-weight:600;">TĂNG GIÁ&nbsp;</span>'
                 + "".join(_chip(t, p) for t, p in gainers) + "</div>"
             )
         if losers:
             rows.append(
-                f'<div><span style="font-size:12px;color:{_GRAY};font-weight:600;">LOSERS&nbsp;</span>'
+                f'<div><span style="font-size:12px;color:{_GRAY};font-weight:600;">GIẢM GIÁ&nbsp;</span>'
                 + "".join(_chip(t, p) for t, p in losers) + "</div>"
             )
         parts.append(f"""\
@@ -895,7 +914,7 @@ def format_email_html(prices, indices, used_source, previous_prices):
             row_html.append(f"""\
 <tr style="background:{stripe};">
   <td style="padding:10px 12px;font-weight:700;color:{_NAVY};">{_html_escape(ticker)}</td>
-  <td colspan="4" style="padding:10px 12px;color:{_GRAY};font-size:13px;">unavailable this run</td>
+  <td colspan="4" style="padding:10px 12px;color:{_GRAY};font-size:13px;">không có dữ liệu lần này</td>
 </tr>""")
             continue
         pct = _pct_change(vals)
@@ -911,14 +930,14 @@ def format_email_html(prices, indices, used_source, previous_prices):
 
     parts.append(f"""\
 <tr><td style="padding:20px 28px 4px 28px;">
-  <div style="font-size:13px;font-weight:700;color:{_NAVY};text-transform:uppercase;letter-spacing:0.04em;margin-bottom:8px;">Closing Prices</div>
+  <div style="font-size:13px;font-weight:700;color:{_NAVY};text-transform:uppercase;letter-spacing:0.04em;margin-bottom:8px;">Giá Đóng Cửa</div>
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid {_BORDER};border-radius:8px;overflow:hidden;font-size:14px;">
     <tr style="background:#f8fafc;">
-      <th align="left" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Ticker</th>
-      <th align="right" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Close (VND)</th>
-      <th align="center" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Change</th>
-      <th align="right" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Volume</th>
-      <th align="right" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Source</th>
+      <th align="left" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Mã CK</th>
+      <th align="right" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Giá đóng cửa (VNĐ)</th>
+      <th align="center" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Thay đổi</th>
+      <th align="right" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Khối lượng</th>
+      <th align="right" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Nguồn</th>
     </tr>
     {''.join(row_html)}
   </table>
@@ -926,37 +945,33 @@ def format_email_html(prices, indices, used_source, previous_prices):
 """)
 
     # --- Weekly trend ---
-    trend = weekly_trend_section()
+    trend = weekly_trend_data()
     if trend:
-        # trend[0] is a title line, trend[1] is a divider, rest are "TICKER  UP +x.xx% ..." lines
         trend_rows = []
-        for line in trend[2:]:
-            ticker = line.split()[0]
-            vals_line = line[len(ticker):].strip()
-            is_up = "UP" in vals_line
-            is_down = "DOWN" in vals_line
-            color = _GREEN if is_up else (_RED if is_down else _GRAY)
+        for ticker, pct in trend:
+            color, _bg, arrow = _pct_style(pct)
             trend_rows.append(
                 f'<div style="padding:4px 0;font-size:13px;">'
                 f'<span style="font-weight:700;color:{_NAVY};display:inline-block;width:56px;">{_html_escape(ticker)}</span>'
-                f'<span style="color:{color};font-weight:600;">{_html_escape(vals_line)}</span></div>'
+                f'<span style="color:{color};font-weight:600;">{arrow} {pct:+.2f}% trong tuần qua</span></div>'
             )
         parts.append(f"""\
 <tr><td style="padding:20px 28px 4px 28px;">
-  <div style="font-size:13px;font-weight:700;color:{_NAVY};text-transform:uppercase;letter-spacing:0.04em;margin-bottom:8px;">Weekly Trend (7-Day Change)</div>
+  <div style="font-size:13px;font-weight:700;color:{_NAVY};text-transform:uppercase;letter-spacing:0.04em;margin-bottom:8px;">Xu Hướng Tuần (Thay Đổi 7 Ngày)</div>
   {''.join(trend_rows)}
 </td></tr>
 """)
 
     # --- Footer ---
     sources_used = sorted(set(used_source.values()))
-    sources_line = f"Sources this run: {_html_escape(', '.join(sources_used))}" if sources_used else ""
+    sources_line = f"Nguồn dữ liệu lần này: {_html_escape(', '.join(sources_used))}" if sources_used else ""
     parts.append(f"""\
 <tr><td style="padding:20px 28px 28px 28px;">
   <div style="border-top:1px solid {_BORDER};padding-top:14px;font-size:11px;color:#9ca3af;line-height:1.5;">
     {sources_line}<br>
-    These are public feeds behind each provider's own app, not documented/guaranteed APIs.
-    Verify against your broker before trading on them.
+    Đây là các nguồn dữ liệu công khai từ ứng dụng của từng nhà cung cấp, không phải API
+    chính thức/được đảm bảo. Vui lòng kiểm tra lại với công ty chứng khoán của bạn trước
+    khi giao dịch dựa trên các số liệu này.
   </div>
 </td></tr>
 
@@ -976,12 +991,12 @@ def format_email_html(prices, indices, used_source, previous_prices):
 def send_email(text_body, html_body=None):
     if html_body:
         msg = MIMEMultipart("alternative")
-        msg.attach(MIMEText(text_body, "plain"))
-        msg.attach(MIMEText(html_body, "html"))
+        msg.attach(MIMEText(text_body, "plain", "utf-8"))
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
     else:
-        msg = MIMEText(text_body)
+        msg = MIMEText(text_body, "plain", "utf-8")
 
-    msg["Subject"] = f"VN Stock Watchlist - {now_vn().strftime('%Y-%m-%d %H:%M')}"
+    msg["Subject"] = f"Bảng Giá Cổ Phiếu Việt Nam - {now_vn().strftime('%Y-%m-%d %H:%M')}"
     msg["From"] = GMAIL_ADDRESS
     msg["To"] = STOCK_RECIPIENT
 
