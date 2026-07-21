@@ -151,6 +151,8 @@ DEFAULT_WATCHLIST_BY_EXCHANGE = {
         "GAS", "PLX", "POW",
         # Aviation
         "VJC", "HVN",
+        # Media / entertainment
+        "YEG",
     ],
     "HNX": [
         "SHS",  # Saigon-Hanoi Securities
