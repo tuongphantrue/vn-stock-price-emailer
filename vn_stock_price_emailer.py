@@ -38,7 +38,18 @@ the others):
    endpoint is a fix for that, not independently confirmed with a live
    test here). If both come back empty for a ticker, it falls through to
    the next source rather than erroring.
-3. CafeF (s.cafef.vn) - public AJAX endpoint behind cafef.vn's own price
+3. SSI iBoard (iboard.ssi.com.vn) - SSI is Vietnam's largest brokerage;
+   this hits their unofficial "all stocks" price-board endpoint (not
+   their official, auth-gated FastConnect Data API, which was
+   deliberately not used here). One call returns the whole market rather
+   than one request per ticker. Field names for this endpoint aren't
+   documented anywhere found, so several candidates are tried per value
+   and a ticker is skipped rather than guessed if none match - worth a
+   glance at DEBUG_EMPTY_RESPONSES output on the first real run to
+   sanity-check the parsed numbers look right. Same domestic-VN-site
+   category as CafeF/VNDirect below, so may also get rejected from cloud
+   CI IPs; kept anyway since a single successful call is cheap.
+4. CafeF (s.cafef.vn) - public AJAX endpoint behind cafef.vn's own price
    history pages. Field names verified against several independent
    scrapers using this exact endpoint over multiple years. Requires an
    X-Requested-With: XMLHttpRequest header - without it, the endpoint
@@ -46,7 +57,7 @@ the others):
    appears to reject requests from cloud/datacenter IP ranges (returns
    the same empty/error body regardless of headers sent from GitHub
    Actions), so treat this as a fallback rather than reliable from CI.
-4. VNDirect (finfo-api.vndirect.com.vn) - confirmed reachable and
+5. VNDirect (finfo-api.vndirect.com.vn) - confirmed reachable and
    correctly-shaped in earlier testing, but times out entirely from
    GitHub Actions runners (Azure IP ranges appear to be blocked). Kept as
    a last-resort fallback since it may work fine from a non-cloud IP
@@ -248,6 +259,7 @@ TRADINGVIEW_SCAN_URL = "https://scanner.tradingview.com/scan"
 # a live test in this environment; if it turns out not to help either,
 # the generic endpoint is still tried second as-is.
 TRADINGVIEW_VIETNAM_SCAN_URL = "https://scanner.tradingview.com/vietnam/scan"
+SSI_ALL_STOCKS_URL = "https://iboard.ssi.com.vn/dchart/api/1.1/defaultAllStocks"
 CAFEF_HISTORY_URL = "https://s.cafef.vn/Ajax/PageNew/DataHistory/PriceHistory.ashx"
 VNDIRECT_QUOTES_URL = "https://finfo-api.vndirect.com.vn/v4/stock_prices"
 
@@ -498,7 +510,75 @@ def fetch_tradingview_indices():
     return result
 
 
-# --- Source 3: CafeF ----------------------------------------------------------
+# --- Source 3: SSI iBoard --------------------------------------------------------
+
+
+def fetch_ssi_stock_prices(tickers):
+    """Returns {ticker: {"close": VND, "prev_close": VND|None, "volume": int}}.
+
+    Hits SSI's unofficial iBoard "all stocks" endpoint - reverse-engineered
+    from SSI's own public price-board webpage, documented by a third-party
+    write-up as a practice/learning API, NOT to be confused with SSI's
+    official FastConnect Data API (which requires registering for a
+    consumer ID/secret - a real auth-gated product, deliberately not used
+    here). One HTTP call returns the whole market, filtered down to the
+    requested tickers here rather than looked up individually.
+
+    Field names are best-effort: no official schema was found for this
+    endpoint, so several plausible candidates are tried per value and a
+    ticker is skipped entirely (not guessed) if none match. Being a
+    domestic VN site, same category as CafeF/VNDirect, it may also get
+    rejected from cloud CI IPs - kept as a low-cost fallback either way,
+    since one successful call is cheap even if it often fails.
+    """
+    result = {}
+    try:
+        resp = requests.get(SSI_ALL_STOCKS_URL, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        print(f"SSI fetch failed entirely: {e}")
+        return result
+
+    rows = data if isinstance(data, list) else (data.get("data") or data.get("Data") or [])
+    if not rows:
+        if DEBUG_EMPTY_RESPONSES:
+            snippet = json.dumps(data)[:200] if isinstance(data, (dict, list)) else str(data)[:200]
+            print(f"SSI empty response: {snippet}")
+        return result
+
+    wanted = set(tickers)
+    for row in rows:
+        symbol = _first_present(row, ["stockSymbol", "symbol", "code", "Symbol", "StockSymbol"])
+        if symbol not in wanted:
+            continue
+        close = _first_present(
+            row, ["matchedPrice", "lastPrice", "closePrice", "close", "MatchedPrice", "ClosePrice"]
+        )
+        prev_close = _first_present(
+            row, ["priorClosePrice", "refPrice", "referencePrice", "basicPrice", "RefPrice", "PriorClosePrice"]
+        )
+        volume = _first_present(
+            row, ["totalVolume", "nmTotalTradedQty", "matchedVolume", "TotalVolume", "MatchedVolume"]
+        ) or 0
+        if close is None:
+            if DEBUG_EMPTY_RESPONSES:
+                print(f"SSI no recognized close field for {symbol}: keys={list(row.keys())}")
+            continue
+        result[symbol] = {
+            "close": float(close),
+            "prev_close": float(prev_close) if prev_close else None,
+            "volume": int(volume),
+        }
+
+    if DEBUG_EMPTY_RESPONSES and result:
+        sample_ticker = next(iter(result))
+        print(f"SSI sample parsed value ({sample_ticker}): {result[sample_ticker]} - sanity-check this against a known price")
+
+    return result
+
+
+# --- Source 4: CafeF ----------------------------------------------------------
 
 
 def _fetch_cafef_history(symbol, page_size=5):
@@ -584,7 +664,7 @@ def fetch_cafef_indices():
     return result
 
 
-# --- Source 4: VNDirect --------------------------------------------------------
+# --- Source 5: VNDirect --------------------------------------------------------
 
 
 def _fetch_vndirect_rows(codes, days_back=15):
@@ -660,10 +740,13 @@ def fetch_vndirect_indices():
 STOCK_SOURCES = [
     ("Yahoo Finance", fetch_yahoo_stock_prices),
     ("TradingView", fetch_tradingview_stock_prices),
+    ("SSI", fetch_ssi_stock_prices),
     ("CafeF", fetch_cafef_stock_prices),
     ("VNDirect", fetch_vndirect_stock_prices),
 ]
 
+# SSI's defaultAllStocks endpoint is a stock price board - no evidence it
+# carries index values (VN-Index etc.), so it's not part of INDEX_SOURCES.
 INDEX_SOURCES = [
     ("Yahoo Finance", fetch_yahoo_indices),
     ("TradingView", fetch_tradingview_indices),
