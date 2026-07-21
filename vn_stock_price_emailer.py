@@ -304,6 +304,17 @@ CAFEF_HEADERS = dict(
     # before it will read the query string at all.
     **{"X-Requested-With": "XMLHttpRequest"},
 )
+# SSI's iBoard endpoint returned HTTP 200 with a completely empty body (not
+# even an error JSON, just zero bytes) when called with only generic
+# headers - same "looks successful, isn't" pattern as CafeF above before
+# its fix. Sending matching Referer/Origin/XHR headers to look like a real
+# request from the iBoard page itself.
+SSI_HEADERS = dict(
+    HEADERS,
+    Referer="https://iboard.ssi.com.vn/",
+    Origin="https://iboard.ssi.com.vn",
+    **{"X-Requested-With": "XMLHttpRequest"},
+)
 REQUEST_TIMEOUT = 15
 DEBUG_EMPTY_RESPONSES = _env("DEBUG_EMPTY_RESPONSES") is not None
 
@@ -533,7 +544,12 @@ def fetch_ssi_stock_prices(tickers):
 
     Field names are best-effort: no official schema was found for this
     endpoint, so several plausible candidates are tried per value and a
-    ticker is skipped entirely (not guessed) if none match.
+    ticker is skipped entirely (not guessed) if none match. In production,
+    this endpoint returned HTTP 200 with a completely empty body when
+    called with only generic headers (same "looks successful, isn't"
+    pattern CafeF showed before its own header fix) - now sends matching
+    Referer/Origin/X-Requested-With headers (SSI_HEADERS) to look like a
+    real request from the iBoard page itself.
 
     Called independently, always, rather than as a STOCK_SOURCES cascade
     fallback - being a domestic VN site (same category as CafeF/VNDirect)
@@ -545,11 +561,30 @@ def fetch_ssi_stock_prices(tickers):
     """
     result = {}
     try:
-        resp = requests.get(SSI_ALL_STOCKS_URL, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        resp = requests.get(SSI_ALL_STOCKS_URL, headers=SSI_HEADERS, timeout=REQUEST_TIMEOUT)
+    except Exception as e:
+        print(f"SSI fetch failed entirely (request error): {e}")
+        return result
+
+    try:
         resp.raise_for_status()
+    except Exception as e:
+        print(f"SSI fetch failed entirely (HTTP error): {e}")
+        return result
+
+    try:
         data = resp.json()
     except Exception as e:
-        print(f"SSI fetch failed entirely: {e}")
+        # A JSON decode failure on a 200 response usually means an empty or
+        # non-JSON body (e.g. a bot-detection layer returning nothing rather
+        # than an explicit error) - log what actually came back so this is
+        # diagnosable instead of just showing a cryptic decode error.
+        body_len = len(resp.content) if resp.content is not None else 0
+        snippet = resp.text[:200] if resp.text else "(empty body)"
+        print(
+            f"SSI fetch failed entirely (bad JSON, status={resp.status_code}, "
+            f"body_len={body_len}): {e} - body snippet: {snippet!r}"
+        )
         return result
 
     rows = data if isinstance(data, list) else (data.get("data") or data.get("Data") or [])
