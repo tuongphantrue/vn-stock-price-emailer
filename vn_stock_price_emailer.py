@@ -31,9 +31,13 @@ the others):
    Also globally-hosted infrastructure, same category as Yahoo above.
    Each ticker is qualified with its actual exchange (HOSE/HNX/UPCOM) via
    TICKER_EXCHANGE - a ticker this script doesn't have an exchange
-   mapping for defaults to HOSE and, if that guess is wrong, just comes
-   back empty here and falls through to the next source rather than
-   erroring.
+   mapping for defaults to HOSE. Tries a Vietnam-scoped scanner endpoint
+   first, then the generic cross-market one for anything still missing
+   (in practice, the generic endpoint alone returned data for some HOSE
+   tickers but nothing at all for HNX/UPCOM ones - the country-scoped
+   endpoint is a fix for that, not independently confirmed with a live
+   test here). If both come back empty for a ticker, it falls through to
+   the next source rather than erroring.
 3. CafeF (s.cafef.vn) - public AJAX endpoint behind cafef.vn's own price
    history pages. Field names verified against several independent
    scrapers using this exact endpoint over multiple years. Requires an
@@ -132,21 +136,21 @@ def format_vn_datetime(dt):
 DEFAULT_WATCHLIST_BY_EXCHANGE = {
     "HOSE": [
         # Banking
-        "VCB", "TCB", "MBB", "BID", "CTG", "ACB", "VPB",
+        "VCB", "TCB", "MBB", "BID", "CTG", "ACB", "VPB", "STB", "HDB", "TPB",
         # Real estate
-        "VIC", "VHM", "NVL", "KDH",
+        "VIC", "VHM", "NVL", "KDH", "DXG", "PDR",
         # Retail / consumer
-        "MWG", "PNJ", "VNM", "SAB",
+        "MWG", "PNJ", "VNM", "SAB", "MSN",
         # Industrials / materials
-        "HPG", "GVR", "DGC",
+        "HPG", "GVR", "DGC", "HSG",
         # Technology
         "FPT",
         # Securities
-        "SSI",
+        "SSI", "VND", "VCI", "HCM",
         # Energy / utilities
         "GAS", "PLX", "POW",
         # Aviation
-        "VJC",
+        "VJC", "HVN",
     ],
     "HNX": [
         "SHS",  # Saigon-Hanoi Securities
@@ -155,6 +159,11 @@ DEFAULT_WATCHLIST_BY_EXCHANGE = {
         "VCS",  # Vicostone
         "CEO",  # CEO Group
         "NTP",  # Tien Phong Plastic
+        "PVI",  # PVI Holdings
+        "TNG",  # TNG Investment and Trading
+        "BAB",  # Bac A Commercial Bank
+        "MBS",  # MB Securities
+        "VC3",  # Vinaconex 3
     ],
     "UPCOM": [
         "BSR",  # Binh Son Refining
@@ -162,6 +171,10 @@ DEFAULT_WATCHLIST_BY_EXCHANGE = {
         "VEA",  # VEAM Corporation
         "MCH",  # Masan Consumer Holdings
         "QNS",  # Quang Ngai Sugar
+        "VGI",  # Viettel Global Investment
+        "FOX",  # FPT Telecom
+        "VGT",  # Vietnam National Textile and Garment Group (Vinatex)
+        "LTG",  # Loc Troi Group
     ],
 }
 
@@ -223,6 +236,16 @@ INDICES = [
 
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 TRADINGVIEW_SCAN_URL = "https://scanner.tradingview.com/scan"
+# A country/market-scoped scanner endpoint also exists (confirmed via the
+# same open-source wrapper's docs, which reference market="vietnam" as a
+# supported scope). The generic /scan endpoint above appeared to only
+# return data for some HOSE tickers in practice and came back empty for
+# every HNX/UPCOM ticker tried - this market-scoped endpoint is tried
+# first now, on the theory that it indexes the full local instrument
+# universe rather than a curated cross-market subset. Not confirmed with
+# a live test in this environment; if it turns out not to help either,
+# the generic endpoint is still tried second as-is.
+TRADINGVIEW_VIETNAM_SCAN_URL = "https://scanner.tradingview.com/vietnam/scan"
 CAFEF_HISTORY_URL = "https://s.cafef.vn/Ajax/PageNew/DataHistory/PriceHistory.ashx"
 VNDIRECT_QUOTES_URL = "https://finfo-api.vndirect.com.vn/v4/stock_prices"
 
@@ -367,13 +390,13 @@ def fetch_yahoo_indices():
 # --- Source 2: TradingView -------------------------------------------------------
 
 
-def _tradingview_scan(qualified_tickers, columns):
+def _tradingview_scan(qualified_tickers, columns, url=TRADINGVIEW_SCAN_URL):
     """POSTs a batch scan request for fully-qualified TradingView tickers
     (e.g. "HOSE:VNM") and returns {bare_ticker: {column_name: value}}. One
     HTTP call covers the whole batch, across mixed exchanges if needed.
     """
     resp = requests.post(
-        TRADINGVIEW_SCAN_URL,
+        url,
         headers=HEADERS,
         json={"symbols": {"tickers": qualified_tickers, "query": {"types": []}}, "columns": columns},
         timeout=REQUEST_TIMEOUT,
@@ -382,7 +405,7 @@ def _tradingview_scan(qualified_tickers, columns):
     data = resp.json()
     rows = data.get("data") or []
     if not rows and DEBUG_EMPTY_RESPONSES:
-        print(f"TradingView empty scan response: {json.dumps(data)[:200]}")
+        print(f"TradingView empty scan response ({url}): {json.dumps(data)[:200]}")
     result = {}
     for row in rows:
         symbol = row.get("s", "")
@@ -404,39 +427,45 @@ def _tradingview_prev_close(close, change_pct):
 def fetch_tradingview_stock_prices(tickers):
     """Returns {ticker: {"close": VND, "prev_close": VND|None, "volume": int}}.
     Each ticker is qualified with its actual exchange (HOSE/HNX/UPCOM) via
-    ticker_exchange() rather than assuming HOSE for everything - a wrong
-    guess here would previously have silently returned nothing for any
-    HNX/UPCOM ticker.
+    ticker_exchange() rather than assuming HOSE for everything. Tries the
+    Vietnam-scoped scanner endpoint first, then the generic one for
+    whatever's still missing - see TRADINGVIEW_VIETNAM_SCAN_URL comment.
     """
     result = {}
-    try:
-        qualified = [f"{ticker_exchange(t)}:{t}" for t in tickers]
-        rows = _tradingview_scan(qualified, ["close", "change", "volume"])
-    except Exception as e:
-        print(f"TradingView fetch failed entirely: {e}")
-        return result
+    qualified = {t: f"{ticker_exchange(t)}:{t}" for t in tickers}
 
-    for ticker in tickers:
-        vals = rows.get(ticker)
-        if not vals or vals.get("close") is None:
+    for url in (TRADINGVIEW_VIETNAM_SCAN_URL, TRADINGVIEW_SCAN_URL):
+        missing = [t for t in tickers if t not in result]
+        if not missing:
+            break
+        try:
+            rows = _tradingview_scan(
+                [qualified[t] for t in missing], ["close", "change", "volume"], url=url
+            )
+        except Exception as e:
+            print(f"TradingView fetch failed entirely ({url}): {e}")
             continue
-        close = vals["close"]
-        prev_close = _tradingview_prev_close(close, vals.get("change"))
-        result[ticker] = {
-            "close": float(close),
-            "prev_close": float(prev_close) if prev_close is not None else None,
-            "volume": int(vals.get("volume") or 0),
-        }
+        for ticker in missing:
+            vals = rows.get(ticker)
+            if not vals or vals.get("close") is None:
+                continue
+            close = vals["close"]
+            prev_close = _tradingview_prev_close(close, vals.get("change"))
+            result[ticker] = {
+                "close": float(close),
+                "prev_close": float(prev_close) if prev_close is not None else None,
+                "volume": int(vals.get("volume") or 0),
+            }
     return result
 
 
 def fetch_tradingview_indices():
-    """VN-Index is confirmed under HOSE:VNINDEX (seen directly on
-    TradingView's own site). HNX-Index / UPCOM-Index ticker qualifiers
-    (HNX:HNXINDEX, UPCOM:UPCOMINDEX) follow the same exchange:ticker
-    convention but weren't independently confirmed - if they're wrong,
-    those two labels just come back empty and fall through to CafeF/
-    VNDirect, same graceful-miss behavior as everywhere else in this file.
+    """VN-Index (HOSE:VNINDEX) and HNX-Index (HNX:HNXINDEX) are both
+    confirmed directly against TradingView's own site. UPCOM-Index
+    (UPCOM:UPCOMINDEX) follows the same convention but wasn't
+    independently confirmed - if it's wrong, that label just comes back
+    empty and falls through to CafeF/VNDirect, same as everywhere else.
+    Tries the Vietnam-scoped scanner first, then the generic one.
     """
     index_tickers = {
         "HOSE:VNINDEX": "VN-Index",
@@ -444,23 +473,26 @@ def fetch_tradingview_indices():
         "UPCOM:UPCOMINDEX": "UPCOM-Index",
     }
     result = {}
-    try:
-        rows = _tradingview_scan(list(index_tickers.keys()), ["close", "change"])
-    except Exception as e:
-        print(f"TradingView index fetch failed entirely: {e}")
-        return result
-
-    for qualified, label in index_tickers.items():
-        bare = qualified.split(":", 1)[-1]
-        vals = rows.get(bare)
-        if not vals or vals.get("close") is None:
+    for url in (TRADINGVIEW_VIETNAM_SCAN_URL, TRADINGVIEW_SCAN_URL):
+        missing = {q: label for q, label in index_tickers.items() if label not in result}
+        if not missing:
+            break
+        try:
+            rows = _tradingview_scan(list(missing.keys()), ["close", "change"], url=url)
+        except Exception as e:
+            print(f"TradingView index fetch failed entirely ({url}): {e}")
             continue
-        close = vals["close"]
-        prev_close = _tradingview_prev_close(close, vals.get("change"))
-        result[label] = {
-            "close": float(close),
-            "prev_close": float(prev_close) if prev_close is not None else None,
-        }
+        for qualified, label in missing.items():
+            bare = qualified.split(":", 1)[-1]
+            vals = rows.get(bare)
+            if not vals or vals.get("close") is None:
+                continue
+            close = vals["close"]
+            prev_close = _tradingview_prev_close(close, vals.get("change"))
+            result[label] = {
+                "close": float(close),
+                "prev_close": float(prev_close) if prev_close is not None else None,
+            }
     return result
 
 
