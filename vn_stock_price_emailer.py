@@ -11,72 +11,36 @@ Modeled on the same pattern as currency-rate-emailer / gold-price-emailer /
 tech-price-mailer: pulls from public sources, degrades gracefully if one
 fails, tracks state/history, and emails a summary.
 
-Stock/index prices for the watchlist come from a cascade of sources, tried
-in this order per ticker (first success wins for that ticker; sources are
-independent hosts, so a block on one doesn't take out the others):
+Stock/index prices come from two sources, tried in this order per ticker
+(first success wins for that ticker):
 
 1. Yahoo Finance (query1.finance.yahoo.com) - Vietnamese tickers are
    available there under a .VN suffix (e.g. VNM.VN, VCB.VN) and VN-Index
-   under ^VNINDEX.VN. This is US-hosted infrastructure entirely separate
-   from Vietnam's domestic anti-scraping layers, and its chart API is
-   used from every kind of environment (including cloud CI) without the
-   IP-based blocking seen on the Vietnamese sources below. Prices are
-   already in plain VND, no thousand-scaling needed. HNX-Index and
-   UPCOM-Index don't have a confirmed Yahoo ticker, so those two fall
-   through to the sources below.
+   under ^VNINDEX.VN. Prices are already in plain VND, no thousand-scaling
+   needed. HNX-Index and UPCOM-Index don't have a confirmed Yahoo ticker,
+   so those two fall through to TradingView.
 2. TradingView (scanner.tradingview.com) - TradingView's own scanner/
    screener API, confirmed via an open-source Python wrapper's docs and
-   usage examples (one of its own examples successfully queries a
-   Vietnamese ticker, HOSE:VIX, in the same batched call as US tickers).
-   Also globally-hosted infrastructure, same category as Yahoo above.
-   Each ticker is qualified with its actual exchange (HOSE/HNX/UPCOM) via
-   TICKER_EXCHANGE - a ticker this script doesn't have an exchange
-   mapping for defaults to HOSE. Confirmed in production to give full
-   HOSE/HNX/UPCOM coverage via a Vietnam-scoped scanner endpoint.
-3. CafeF (s.cafef.vn) - public AJAX endpoint behind cafef.vn's own price
-   history pages. Field names verified against several independent
-   scrapers using this exact endpoint over multiple years. Requires an
-   X-Requested-With: XMLHttpRequest header - without it, the endpoint
-   returns HTTP 200 with an empty/error body instead of real data. Also
-   appears to reject requests from cloud/datacenter IP ranges (returns
-   the same empty/error body regardless of headers sent from GitHub
-   Actions), so treat this as a fallback rather than reliable from CI.
-4. VNDirect (finfo-api.vndirect.com.vn) - confirmed reachable and
-   correctly-shaped in earlier testing, but times out entirely from
-   GitHub Actions runners (Azure IP ranges appear to be blocked). Kept as
-   a last-resort fallback since it may work fine from a non-cloud IP
-   (e.g. your own machine, or a self-hosted runner).
+   usage examples. Each ticker is qualified with its actual exchange
+   (HOSE/HNX/UPCOM) via TICKER_EXCHANGE - a ticker this script doesn't
+   have an exchange mapping for defaults to HOSE. Confirmed in production
+   to give full HOSE/HNX/UPCOM coverage via a Vietnam-scoped scanner
+   endpoint (TRADINGVIEW_VIETNAM_SCAN_URL).
 
-SSI iBoard (iboard.ssi.com.vn) is deliberately NOT part of this cascade.
-SSI is Vietnam's largest brokerage; this hits their real iBoard GraphQL
-API (not their official, auth-gated FastConnect Data API, which was
-deliberately not used here), queried once per exchange (hose/hnx/upcom -
-each call returns that whole exchange, filtered down to the watchlist).
-It's fetched independently and unconditionally every run, and rendered as
-its own dedicated email section rather than blended into the main price
-table's Source column - both so it's genuinely cross-checkable against
-the cascade's numbers, and because a source sitting at the bottom of a
-cascade can go permanently unexercised and unnoticed if everything above
-it already succeeds (which is exactly what happened the one time SSI was
-tried as a cascade fallback here). The GraphQL endpoint and exact field
-names (matchedPrice, refPrice, matchedVolume) were confirmed via a
-complete, runnable third-party script - an earlier REST-style endpoint
-this used to point to (from a 2023 write-up) turned out to be stale,
-silently returning SSI's app HTML shell instead of data or an error,
-which is what an outdated URL against a single-page app typically does.
-Being a domestic VN site (same category as CafeF/VNDirect above), it may
-still get rejected from cloud CI IPs - if so, its section just won't
-appear in the email that run.
+Both are globally-hosted infrastructure, confirmed reliable from GitHub
+Actions. Three domestic Vietnamese sources - CafeF, VNDirect, and SSI's
+iBoard - were also tried and each confirmed blocked from GitHub Actions'
+cloud IPs in a different way (CafeF: a fake-success empty response;
+VNDirect: connection timeout; SSI: 403 Forbidden) despite being correctly
+implemented against real, working endpoints. They were removed rather than
+kept as permanently-inert code; a proxy with residential/ISP IPs (not
+datacenter) would very likely be needed for a domestic VN source to work
+from a cloud CI runner - worth revisiting if that's ever set up.
 
-(FireAnt was tried as a source but dropped: its documented-looking
-endpoint 404s outright, and other people's write-ups of FireAnt's API note
-it may require authentication that isn't publicly available - not worth
-guessing at further without real docs.)
-
-None of these are documented/versioned APIs - they're the public JSON
-endpoints behind each site's own web app, the same category of caveat the
-Vietcombank source carries in currency-rate-emailer. Any of them can
-change shape, rate-limit, or block a given IP range without notice.
+Neither Yahoo Finance nor TradingView are documented/versioned APIs -
+they're public JSON endpoints, the same category of caveat the
+Vietcombank source carries in currency-rate-emailer. Either can change
+shape, rate-limit, or block a given IP range without notice.
 
 Extra features (matching the sibling emailers):
 
@@ -87,8 +51,7 @@ Extra features (matching the sibling emailers):
   and emails a 7-day % change summary once a week
 - Move-threshold alerting: only send if some stock moved >= X% since the
   last run (optional)
-- Per-run footer noting which source(s) actually supplied data, so you
-  can tell at a glance if one of the three has gone dark
+- Per-run footer noting which source(s) actually supplied data
 
 Usage:
     python vn_stock_price_emailer.py generate      # fetch prices, build email body -> email_body.txt
@@ -110,12 +73,6 @@ Optional environment variables:
     DEBUG_EMPTY_RESPONSES    - set to any non-empty value to log the actual HTTP
                                 status/body when a source returns no usable data,
                                 instead of failing silently
-    PROXY_URL                - routes CafeF/VNDirect/SSI requests through a proxy
-                                (e.g. http://user:pass@host:port). Not needed for
-                                Yahoo Finance/TradingView, which work without one.
-                                See the "Optional proxy support" comment above
-                                PROXIES below for why this exists and what kind of
-                                proxy actually helps.
 """
 
 import os
@@ -263,26 +220,15 @@ INDICES = [
 
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 TRADINGVIEW_SCAN_URL = "https://scanner.tradingview.com/scan"
-# A country/market-scoped scanner endpoint also exists (confirmed via the
-# same open-source wrapper's docs, which reference market="vietnam" as a
+# A country/market-scoped scanner endpoint also exists (confirmed via an
+# open-source Python wrapper's docs, which reference market="vietnam" as a
 # supported scope). The generic /scan endpoint above appeared to only
 # return data for some HOSE tickers in practice and came back empty for
 # every HNX/UPCOM ticker tried - this market-scoped endpoint is tried
 # first now, on the theory that it indexes the full local instrument
-# universe rather than a curated cross-market subset. Not confirmed with
-# a live test in this environment; if it turns out not to help either,
-# the generic endpoint is still tried second as-is.
+# universe rather than a curated cross-market subset. Confirmed in
+# production to give full HOSE/HNX/UPCOM coverage.
 TRADINGVIEW_VIETNAM_SCAN_URL = "https://scanner.tradingview.com/vietnam/scan"
-# SSI's real current price-board API: confirmed via a complete, runnable
-# third-party script (not a blog description) that POSTs a GraphQL query
-# here and successfully parses the response. The older REST-style URL this
-# constant used to point to (dchart/api/1.1/defaultAllStocks, from a 2023
-# write-up) turned out to be stale - it silently returned SSI's app-shell
-# HTML instead of JSON or an error, meaning SSI has since moved their
-# iBoard data layer to GraphQL. See fetch_ssi_stock_prices() for the query.
-SSI_GRAPHQL_URL = "https://iboard.ssi.com.vn/gateway/graphql"
-CAFEF_HISTORY_URL = "https://s.cafef.vn/Ajax/PageNew/DataHistory/PriceHistory.ashx"
-VNDIRECT_QUOTES_URL = "https://finfo-api.vndirect.com.vn/v4/stock_prices"
 
 EMAIL_BODY_FILE = "email_body.txt"
 EMAIL_HTML_FILE = "email_body.html"
@@ -300,7 +246,7 @@ SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
 
 HEADERS = {
-    # Several of these hosts block the bare default "python-requests/x.y"
+    # Both of these hosts block the bare default "python-requests/x.y"
     # User-Agent, so we look like an ordinary browser instead.
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -308,86 +254,8 @@ HEADERS = {
     ),
     "Accept": "application/json",
 }
-# CafeF's AJAX endpoint is called from cafef.vn pages via XHR in the browser;
-# it may check Referer/Origin (common hotlink-protection) and silently return
-# an empty result set to requests that don't look like they came from the
-# site itself, rather than an HTTP error. Send matching headers to look like
-# a real page load.
-CAFEF_HEADERS = dict(
-    HEADERS,
-    Referer="https://cafef.vn/",
-    Origin="https://cafef.vn",
-    # CafeF's .ashx handler returned HTTP 200 with {"Message":"symbol is null
-    # or empty"} for every ticker until this header was added - it appears
-    # to require this to treat the request as a genuine in-page AJAX call
-    # before it will read the query string at all.
-    **{"X-Requested-With": "XMLHttpRequest"},
-)
-# Matches the exact headers used by the confirmed-working third-party
-# script this GraphQL query was sourced from - notably Accept: text/plain,
-# not application/json, which is what that script's server response
-# actually expects to be asked for. Referer/Origin added defensively (not
-# present in that script, but a safe, low-risk addition based on the
-# pattern that helped with CafeF).
-SSI_HEADERS = dict(
-    HEADERS,
-    Referer="https://iboard.ssi.com.vn/",
-    Origin="https://iboard.ssi.com.vn",
-    Accept="text/plain",
-    **{"Content-Type": "application/json"},
-)
 REQUEST_TIMEOUT = 15
 DEBUG_EMPTY_RESPONSES = _env("DEBUG_EMPTY_RESPONSES") is not None
-
-# Optional proxy support for the domestic VN sources (CafeF, VNDirect, SSI)
-# that have been confirmed blocked from GitHub Actions' cloud IPs in three
-# different ways (CafeF: fake-empty 200, VNDirect: connection timeout, SSI:
-# 403 Forbidden) - different symptoms, same likely cause (WAF/gateway
-# rejecting known datacenter IP ranges). Headers can't fix an IP-level
-# block, so this routes just those three sources through PROXY_URL if set.
-#
-# PROXY_URL should be a full proxy URL including credentials if needed:
-#   http://user:pass@host:port
-#   socks5://user:pass@host:port   (needs the PySocks package - already in
-#                                    requirements.txt for this reason)
-# Unset (the default) means no proxy - requests go out directly, same as
-# before this was added, and Yahoo/TradingView are never routed through
-# the proxy either way since they don't need it and it would just spend
-# proxy bandwidth for no benefit.
-#
-# A *datacenter* proxy is unlikely to help here, since the whole problem is
-# datacenter IP ranges getting blocked in the first place - a proxy service
-# offering residential or "ISP" IPs is what's actually needed. See the
-# README for provider suggestions.
-def _proxy_config():
-    proxy_url = _env("PROXY_URL")
-    if not proxy_url:
-        return None
-    return {"http": proxy_url, "https": proxy_url}
-
-
-PROXIES = _proxy_config()
-
-
-def _debug_snippet(resp):
-    """Best-effort short debug string for a response that came back with no
-    usable rows: status code + first ~150 chars of body. Helps tell apart
-    'blocked and served an HTML/captcha page' from 'valid JSON, just empty'.
-    """
-    try:
-        return f"status={resp.status_code} body[:150]={resp.text[:150]!r}"
-    except Exception:
-        return "status=? body=?"
-
-
-def _first_present(d, keys):
-    """Returns the first non-None value found in dict d for any key in keys."""
-    if not d:
-        return None
-    for key in keys:
-        if key in d and d[key] is not None:
-            return d[key]
-    return None
 
 
 # --- Source 1: Yahoo Finance ---------------------------------------------------
@@ -421,7 +289,7 @@ def _fetch_yahoo_chart(symbol, days_back=10):
 def fetch_yahoo_stock_prices(tickers):
     """Returns {ticker: {"close": VND, "prev_close": VND|None, "volume": int}}.
     Yahoo already reports Vietnamese stock prices in plain VND (not
-    thousands), so no scaling is needed here, unlike CafeF/TCBS.
+    thousands), so no scaling is needed here.
     """
     result = {}
     for ticker in tickers:
@@ -445,9 +313,9 @@ def fetch_yahoo_stock_prices(tickers):
 def fetch_yahoo_indices():
     """Only VN-Index is confirmed available on Yahoo Finance under a stable
     symbol (^VNINDEX.VN) - HNX-Index / UPCOM-Index don't have a confirmed
-    Yahoo ticker, so they're left for the CafeF/VNDirect fallback (the
-    merge-by-label logic in fetch_all_indices() already handles a source
-    covering only part of the index list).
+    Yahoo ticker, so they're left for TradingView (the merge-by-label
+    logic in fetch_all_indices() already handles a source covering only
+    part of the index list).
     """
     result = {}
     try:
@@ -541,9 +409,8 @@ def fetch_tradingview_indices():
     confirmed directly against TradingView's own site. UPCOM-Index
     (UPCOM:UPCOMINDEX) follows the same convention but wasn't
     independently confirmed, and in practice the Vietnam-scoped scanner
-    hasn't returned a value for it - falls through to CafeF/VNDirect
-    like everywhere else, and if those also miss, the email shows an
-    "unavailable" row for it rather than silently dropping it.
+    hasn't returned a value for it - if Yahoo also misses it, the email
+    shows an "unavailable" row for it rather than silently dropping it.
 
     Known minor gap, not yet root-caused: VN-Index's % change has come
     back empty in production even though its points value comes through
@@ -578,283 +445,16 @@ def fetch_tradingview_indices():
     return result
 
 
-# --- SSI iBoard (independent, always-run, not part of the cascade) -------------
-
-
-_SSI_STOCK_REALTIMES_QUERY = (
-    "query stockRealtimes($exchange: String) {\n"
-    "  stockRealtimes(exchange: $exchange) {\n"
-    "    stockSymbol\n"
-    "    matchedPrice\n"
-    "    refPrice\n"
-    "    matchedVolume\n"
-    "    nmTotalTradedQty\n"
-    "    __typename\n"
-    "  }\n"
-    "}\n"
-)
-
-
-def _fetch_ssi_exchange(exchange_lower):
-    """POSTs SSI's GraphQL stockRealtimes query for one exchange
-    ("hose"/"hnx"/"upcom") and returns the raw list of stock objects for
-    that exchange (the query has no per-ticker filter - it returns every
-    listed stock on that exchange in one response).
-    """
-    payload = {
-        "operationName": "stockRealtimes",
-        "variables": {"exchange": exchange_lower},
-        "query": _SSI_STOCK_REALTIMES_QUERY,
-    }
-    resp = requests.post(
-        SSI_GRAPHQL_URL, headers=SSI_HEADERS, json=payload, timeout=REQUEST_TIMEOUT, proxies=PROXIES
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    rows = ((data.get("data") or {}).get("stockRealtimes")) or []
-    if not rows and DEBUG_EMPTY_RESPONSES:
-        print(f"SSI empty response for exchange {exchange_lower}: {json.dumps(data)[:200]}")
-    return rows
-
-
-def fetch_ssi_stock_prices(tickers):
-    """Returns {ticker: {"close": VND, "prev_close": VND|None, "volume": int}}.
-
-    Hits SSI's real iBoard GraphQL API at SSI_GRAPHQL_URL - confirmed via
-    a complete, runnable third-party script (not just a description), which
-    also confirmed the exact field names used below: stockSymbol,
-    matchedPrice (current price), refPrice (previous close - the exchange's
-    own reference price, used directly rather than derived), and
-    matchedVolume/nmTotalTradedQty for volume. NOT the official, auth-gated
-    FastConnect Data API (which requires a registered consumer ID/secret -
-    deliberately not used here).
-
-    The query has no per-ticker filter, so it's called once per exchange
-    actually present in the requested tickers (via ticker_exchange()) - at
-    most 3 calls total (hose/hnx/upcom), each returning that whole
-    exchange's stocks, filtered down to the requested tickers here.
-
-    Price scale is assumed to already be plain VND (matching Yahoo/
-    TradingView/VNDirect), NOT thousand-VND (like CafeF/old-TCBS) - this
-    wasn't independently confirmed since the source script this was
-    pulled from just writes the raw value through without display
-    formatting. Check the DEBUG_EMPTY_RESPONSES sample-value log against a
-    known real price on the first run to confirm.
-
-    Called independently, always, rather than as a STOCK_SOURCES cascade
-    fallback - being a domestic VN site (same category as CafeF/VNDirect)
-    it may still get rejected from cloud CI IPs, but the point of running
-    it unconditionally is so its own dedicated email section is visible
-    every run for cross-checking, rather than silently never executing
-    whenever Yahoo/TradingView already cover the full watchlist (which
-    is what happened the one time it *was* in the cascade).
-    """
-    result = {}
-    wanted = set(tickers)
-    needed_exchanges = sorted({ticker_exchange(t).lower() for t in tickers})
-
-    for exch in needed_exchanges:
-        try:
-            rows = _fetch_ssi_exchange(exch)
-        except Exception as e:
-            print(f"SSI fetch failed for exchange {exch}: {e}")
-            continue
-
-        for row in rows:
-            symbol = row.get("stockSymbol")
-            if symbol not in wanted:
-                continue
-            close = row.get("matchedPrice")
-            if close is None:
-                continue
-            ref_price = row.get("refPrice")
-            volume = row.get("matchedVolume") or row.get("nmTotalTradedQty") or 0
-            result[symbol] = {
-                "close": float(close),
-                "prev_close": float(ref_price) if ref_price else None,
-                "volume": int(volume),
-            }
-
-    if DEBUG_EMPTY_RESPONSES and result:
-        sample_ticker = next(iter(result))
-        print(f"SSI sample parsed value ({sample_ticker}): {result[sample_ticker]} - sanity-check this against a known price")
-
-    return result
-
-
-# --- Source 3: CafeF ----------------------------------------------------------
-
-
-def _fetch_cafef_history(symbol, page_size=5):
-    """Returns rows (newest first) from CafeF's price-history AJAX feed for
-    one symbol. Works for both stock tickers and index codes (VNINDEX etc.)
-    """
-    params = {
-        "Symbol": symbol,
-        "StartDate": "",
-        "EndDate": "",
-        "PageIndex": 1,
-        "PageSize": page_size,
-    }
-    resp = requests.get(
-        CAFEF_HISTORY_URL, headers=CAFEF_HEADERS, params=params, timeout=REQUEST_TIMEOUT, proxies=PROXIES
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    rows = ((data.get("Data") or {}).get("Data")) or []
-
-    if not rows and DEBUG_EMPTY_RESPONSES:
-        print(f"CafeF empty response for {symbol}: {_debug_snippet(resp)}")
-
-    def _row_date(row):
-        try:
-            return datetime.strptime(row.get("Ngay", ""), "%d/%m/%Y")
-        except ValueError:
-            return datetime.min
-
-    rows.sort(key=_row_date, reverse=True)
-    return rows
-
-
-def fetch_cafef_stock_prices(tickers):
-    """Returns {ticker: {"close": VND, "prev_close": VND|None, "volume": int}}.
-    CafeF quotes stock prices in thousand VND (e.g. 85.5 == 85,500 VND), so
-    we scale by 1000 to get plain VND, matching the rest of the script.
-    """
-    result = {}
-    for ticker in tickers:
-        try:
-            rows = _fetch_cafef_history(ticker)
-            if not rows:
-                continue
-            latest = rows[0]
-            prev = rows[1] if len(rows) >= 2 else None
-            close = latest.get("GiaDongCua")
-            if close is None:
-                continue
-            result[ticker] = {
-                "close": float(close) * 1000,
-                "prev_close": float(prev["GiaDongCua"]) * 1000 if prev and prev.get("GiaDongCua") else None,
-                "volume": int(latest.get("KhoiLuongKhopLenh") or 0),
-            }
-        except Exception as e:
-            print(f"CafeF fetch failed for {ticker}: {e}")
-            continue
-    return result
-
-
-def fetch_cafef_indices():
-    """Returns {index_label: {"close": pts, "prev_close": pts|None}}.
-    Index points are used as-is (no thousand-VND scaling).
-    """
-    result = {}
-    for code, label in INDICES:
-        try:
-            rows = _fetch_cafef_history(code)
-            if not rows:
-                continue
-            latest = rows[0]
-            prev = rows[1] if len(rows) >= 2 else None
-            close = latest.get("GiaDongCua")
-            if close is None:
-                continue
-            result[label] = {
-                "close": float(close),
-                "prev_close": float(prev["GiaDongCua"]) if prev and prev.get("GiaDongCua") else None,
-            }
-        except Exception as e:
-            print(f"CafeF index fetch failed for {label}: {e}")
-            continue
-    return result
-
-
-# --- Source 4: VNDirect --------------------------------------------------------
-
-
-def _fetch_vndirect_rows(codes, days_back=15):
-    """Returns raw rows from VNDirect's stock_prices feed for the given
-    codes (list of tickers/index codes) over the last `days_back` days.
-    One HTTP call covers the whole list of codes.
-    """
-    today = now_vn().date()
-    from_date = (today - timedelta(days=days_back)).isoformat()
-    to_date = today.isoformat()
-    query = f"code:{','.join(codes)}~date:gte:{from_date}~date:lte:{to_date}"
-    params = {
-        "sort": "date:desc",
-        "q": query,
-        "size": days_back * max(len(codes), 1),
-        "page": 1,
-    }
-    resp = requests.get(
-        VNDIRECT_QUOTES_URL, headers=HEADERS, params=params, timeout=REQUEST_TIMEOUT, proxies=PROXIES
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    return data.get("data") or []
-
-
-def _vndirect_rows_to_latest_prev(rows, codes):
-    by_code = {}
-    for row in rows:
-        code = row.get("code")
-        if code not in codes:
-            continue
-        by_code.setdefault(code, []).append(row)
-
-    result = {}
-    for code, code_rows in by_code.items():
-        code_rows.sort(key=lambda r: r.get("date", ""), reverse=True)
-        latest = code_rows[0]
-        prev = code_rows[1] if len(code_rows) >= 2 else None
-        close = latest.get("close") or latest.get("adClose")
-        if close is None:
-            continue
-        result[code] = {
-            "close": float(close),
-            "prev_close": float(prev["close"]) if prev and prev.get("close") else None,
-            "volume": int(latest.get("nmVolume") or latest.get("volume") or 0),
-        }
-    return result
-
-
-def fetch_vndirect_stock_prices(tickers):
-    """Returns {ticker: {"close": VND, "prev_close": VND|None, "volume": int}}
-    for the given tickers in one batched HTTP call."""
-    rows = _fetch_vndirect_rows(tickers)
-    return _vndirect_rows_to_latest_prev(rows, set(tickers))
-
-
-def fetch_vndirect_indices():
-    codes = [code for code, _label in INDICES]
-    rows = _fetch_vndirect_rows(codes)
-    by_code = _vndirect_rows_to_latest_prev(rows, set(codes))
-    result = {}
-    for code, label in INDICES:
-        if code in by_code:
-            result[label] = {
-                "close": by_code[code]["close"],
-                "prev_close": by_code[code]["prev_close"],
-            }
-    return result
-
-
 # --- Cascade across sources ----------------------------------------------------
 
 STOCK_SOURCES = [
     ("Yahoo Finance", fetch_yahoo_stock_prices),
     ("TradingView", fetch_tradingview_stock_prices),
-    ("CafeF", fetch_cafef_stock_prices),
-    ("VNDirect", fetch_vndirect_stock_prices),
 ]
 
-# SSI's defaultAllStocks endpoint is a stock price board - no evidence it
-# carries index values (VN-Index etc.), so it's not part of INDEX_SOURCES.
 INDEX_SOURCES = [
     ("Yahoo Finance", fetch_yahoo_indices),
     ("TradingView", fetch_tradingview_indices),
-    ("CafeF", fetch_cafef_indices),
-    ("VNDirect", fetch_vndirect_indices),
 ]
 
 
@@ -1025,7 +625,7 @@ def _pct_arrow_word(pct):
 # --- Formatting: plain text (fallback) --------------------------------------
 
 
-def format_email_body(prices, indices, used_source, previous_prices, ssi_prices=None):
+def format_email_body(prices, indices, used_source, previous_prices):
     lines = [f"Danh mục cổ phiếu Việt Nam - {format_vn_datetime(now_vn())} (Giờ Việt Nam)\n"]
 
     all_index_labels = [label for _code, label in INDICES]
@@ -1077,21 +677,6 @@ def format_email_body(prices, indices, used_source, previous_prices, ssi_prices=
         lines.append("-" * 42)
         for ticker, pct in trend:
             lines.append(f"{ticker:<8}{_pct_arrow_word(pct)} {pct:+.2f}% trong tuần qua")
-
-    if ssi_prices:
-        lines.append("")
-        lines.append("Dữ liệu độc lập từ SSI iBoard (để đối chiếu)")
-        lines.append(f"{'Mã CK':<8}{'Giá đóng cửa (VNĐ)':<22}{'Thay đổi':<14}{'Khối lượng'}")
-        lines.append("-" * 68)
-        for ticker in WATCHLIST:
-            vals = ssi_prices.get(ticker)
-            if not vals:
-                continue
-            pct = _pct_change(vals)
-            change_str = f"{_pct_arrow_word(pct)} {pct:+.2f}%" if pct is not None else ""
-            lines.append(
-                f"{ticker:<8}{vals['close']:,.0f}{'':<12}{change_str:<14}{vals.get('volume', 0):,.0f}"
-            )
 
     sources_used = sorted(set(used_source.values()))
     lines.append("")
@@ -1148,7 +733,7 @@ def _html_escape(s):
     )
 
 
-def format_email_html(prices, indices, used_source, previous_prices, ssi_prices=None):
+def format_email_html(prices, indices, used_source, previous_prices):
     parts = []
     parts.append(f"""\
 <!DOCTYPE html>
@@ -1292,40 +877,6 @@ def format_email_html(prices, indices, used_source, previous_prices, ssi_prices=
 </td></tr>
 """)
 
-    # --- SSI iBoard (independent section, not part of the cascade) ---
-    if ssi_prices:
-        ssi_rows = []
-        for i, ticker in enumerate(WATCHLIST):
-            vals = ssi_prices.get(ticker)
-            if not vals:
-                continue
-            stripe = "#ffffff" if i % 2 == 0 else "#f8fafc"
-            pct = _pct_change(vals)
-            ssi_rows.append(f"""\
-<tr style="background:{stripe};">
-  <td style="padding:10px 12px;font-weight:700;color:{_NAVY};">{_html_escape(ticker)}</td>
-  <td style="padding:10px 12px;text-align:right;font-variant-numeric:tabular-nums;color:{_NAVY};">{vals['close']:,.0f}</td>
-  <td style="padding:10px 12px;text-align:center;">{_change_badge(pct)}</td>
-  <td style="padding:10px 12px;text-align:right;color:{_GRAY};font-size:13px;font-variant-numeric:tabular-nums;">{vals.get('volume', 0):,.0f}</td>
-</tr>""")
-
-        if ssi_rows:
-            parts.append(f"""\
-<tr><td style="padding:20px 28px 4px 28px;">
-  <div style="display:inline-block;padding:2px 9px;border-radius:5px;background:#7c3aed;color:#ffffff;font-size:11px;font-weight:700;letter-spacing:0.04em;margin-bottom:8px;">SSI IBOARD</div>
-  <div style="font-size:11px;color:{_GRAY};margin:4px 0 8px 0;">Dữ liệu độc lập để đối chiếu - không thuộc chuỗi nguồn dự phòng ở trên</div>
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid {_BORDER};border-radius:8px;overflow:hidden;font-size:14px;">
-    <tr style="background:#f8fafc;">
-      <th align="left" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Mã CK</th>
-      <th align="right" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Giá đóng cửa (VNĐ)</th>
-      <th align="center" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Thay đổi</th>
-      <th align="right" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Khối lượng</th>
-    </tr>
-    {''.join(ssi_rows)}
-  </table>
-</td></tr>
-""")
-
     # --- Footer ---
     sources_used = sorted(set(used_source.values()))
     sources_line = f"Nguồn dữ liệu lần này: {_html_escape(', '.join(sources_used))}" if sources_used else ""
@@ -1396,14 +947,8 @@ def cmd_generate():
         print(f"Index fetch failed ({e}), continuing without it.")
         indices = {}
 
-    # SSI is fetched independently and unconditionally (not part of
-    # STOCK_SOURCES) so it always gets a chance to run and show up in its
-    # own email section, rather than potentially never executing whenever
-    # the cascade above already covers the full watchlist.
-    ssi_prices = fetch_ssi_stock_prices(WATCHLIST)
-
-    body = format_email_body(prices, indices, used_source, previous_prices, ssi_prices)
-    html = format_email_html(prices, indices, used_source, previous_prices, ssi_prices)
+    body = format_email_body(prices, indices, used_source, previous_prices)
+    html = format_email_html(prices, indices, used_source, previous_prices)
     with open(EMAIL_BODY_FILE, "w") as f:
         f.write(body)
     with open(EMAIL_HTML_FILE, "w") as f:
@@ -1448,7 +993,7 @@ def cmd_test_sources():
     everything) never actually gets exercised - this bypasses that so you
     can confirm each source still works on its own.
     """
-    print(f"Testing {len(STOCK_SOURCES)} cascade stock source(s) against {len(WATCHLIST)} ticker(s): {', '.join(WATCHLIST)}\n")
+    print(f"Testing {len(STOCK_SOURCES)} stock source(s) against {len(WATCHLIST)} ticker(s): {', '.join(WATCHLIST)}\n")
 
     for name, fetch_fn in STOCK_SOURCES:
         try:
@@ -1465,21 +1010,6 @@ def cmd_test_sources():
         if misses:
             print(f"  missing: {', '.join(misses)}")
         print()
-
-    print("Testing SSI iBoard (independent section, not part of the cascade above)\n")
-    try:
-        result = fetch_ssi_stock_prices(list(WATCHLIST))
-        hits = [t for t in WATCHLIST if t in result]
-        misses = [t for t in WATCHLIST if t not in result]
-        print(f"SSI: {len(hits)}/{len(WATCHLIST)} tickers returned")
-        if hits:
-            sample = hits[0]
-            print(f"  sample: {sample} -> {result[sample]}")
-        if misses:
-            print(f"  missing: {', '.join(misses)}")
-        print()
-    except Exception as e:
-        print(f"SSI: FAILED ENTIRELY - {e}\n")
 
     print(f"Testing {len(INDEX_SOURCES)} index source(s) against {len(INDICES)} index(es)\n")
     index_labels = [label for _code, label in INDICES]
