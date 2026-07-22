@@ -107,6 +107,15 @@ Optional environment variables:
     WATCHLIST                - comma-separated tickers, default below
     ALERT_THRESHOLD_PERCENT  - only send if some stock moved >= this % since last run
                                 (leave unset to always send)
+    DEBUG_EMPTY_RESPONSES    - set to any non-empty value to log the actual HTTP
+                                status/body when a source returns no usable data,
+                                instead of failing silently
+    PROXY_URL                - routes CafeF/VNDirect/SSI requests through a proxy
+                                (e.g. http://user:pass@host:port). Not needed for
+                                Yahoo Finance/TradingView, which work without one.
+                                See the "Optional proxy support" comment above
+                                PROXIES below for why this exists and what kind of
+                                proxy actually helps.
 """
 
 import os
@@ -329,6 +338,35 @@ SSI_HEADERS = dict(
 )
 REQUEST_TIMEOUT = 15
 DEBUG_EMPTY_RESPONSES = _env("DEBUG_EMPTY_RESPONSES") is not None
+
+# Optional proxy support for the domestic VN sources (CafeF, VNDirect, SSI)
+# that have been confirmed blocked from GitHub Actions' cloud IPs in three
+# different ways (CafeF: fake-empty 200, VNDirect: connection timeout, SSI:
+# 403 Forbidden) - different symptoms, same likely cause (WAF/gateway
+# rejecting known datacenter IP ranges). Headers can't fix an IP-level
+# block, so this routes just those three sources through PROXY_URL if set.
+#
+# PROXY_URL should be a full proxy URL including credentials if needed:
+#   http://user:pass@host:port
+#   socks5://user:pass@host:port   (needs the PySocks package - already in
+#                                    requirements.txt for this reason)
+# Unset (the default) means no proxy - requests go out directly, same as
+# before this was added, and Yahoo/TradingView are never routed through
+# the proxy either way since they don't need it and it would just spend
+# proxy bandwidth for no benefit.
+#
+# A *datacenter* proxy is unlikely to help here, since the whole problem is
+# datacenter IP ranges getting blocked in the first place - a proxy service
+# offering residential or "ISP" IPs is what's actually needed. See the
+# README for provider suggestions.
+def _proxy_config():
+    proxy_url = _env("PROXY_URL")
+    if not proxy_url:
+        return None
+    return {"http": proxy_url, "https": proxy_url}
+
+
+PROXIES = _proxy_config()
 
 
 def _debug_snippet(resp):
@@ -568,7 +606,9 @@ def _fetch_ssi_exchange(exchange_lower):
         "variables": {"exchange": exchange_lower},
         "query": _SSI_STOCK_REALTIMES_QUERY,
     }
-    resp = requests.post(SSI_GRAPHQL_URL, headers=SSI_HEADERS, json=payload, timeout=REQUEST_TIMEOUT)
+    resp = requests.post(
+        SSI_GRAPHQL_URL, headers=SSI_HEADERS, json=payload, timeout=REQUEST_TIMEOUT, proxies=PROXIES
+    )
     resp.raise_for_status()
     data = resp.json()
     rows = ((data.get("data") or {}).get("stockRealtimes")) or []
@@ -657,7 +697,7 @@ def _fetch_cafef_history(symbol, page_size=5):
         "PageSize": page_size,
     }
     resp = requests.get(
-        CAFEF_HISTORY_URL, headers=CAFEF_HEADERS, params=params, timeout=REQUEST_TIMEOUT
+        CAFEF_HISTORY_URL, headers=CAFEF_HEADERS, params=params, timeout=REQUEST_TIMEOUT, proxies=PROXIES
     )
     resp.raise_for_status()
     data = resp.json()
@@ -747,7 +787,7 @@ def _fetch_vndirect_rows(codes, days_back=15):
         "page": 1,
     }
     resp = requests.get(
-        VNDIRECT_QUOTES_URL, headers=HEADERS, params=params, timeout=REQUEST_TIMEOUT
+        VNDIRECT_QUOTES_URL, headers=HEADERS, params=params, timeout=REQUEST_TIMEOUT, proxies=PROXIES
     )
     resp.raise_for_status()
     data = resp.json()
