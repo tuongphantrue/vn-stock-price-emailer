@@ -2,6 +2,7 @@ name: Send VN stock price email
 
 on:
   schedule:
+    # User-set schedule: every 30 minutes. Do not change this line.
     - cron: "*/30 * * * *"
   workflow_dispatch: {}
 
@@ -28,6 +29,7 @@ jobs:
           WATCHLIST: ${{ vars.WATCHLIST }}
           ALERT_THRESHOLD_PERCENT: ${{ vars.ALERT_THRESHOLD_PERCENT }}
           DEBUG_EMPTY_RESPONSES: ${{ vars.DEBUG_EMPTY_RESPONSES }}
+          PROXY_URL: ${{ secrets.PROXY_URL }}
         run: python vn_stock_price_emailer.py generate
 
       - name: Send email
