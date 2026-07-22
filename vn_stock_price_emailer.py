@@ -48,22 +48,25 @@ independent hosts, so a block on one doesn't take out the others):
    (e.g. your own machine, or a self-hosted runner).
 
 SSI iBoard (iboard.ssi.com.vn) is deliberately NOT part of this cascade.
-SSI is Vietnam's largest brokerage; this hits their unofficial "all
-stocks" price-board endpoint (not their official, auth-gated FastConnect
-Data API, which was deliberately not used here) in one call covering the
-whole market. It's fetched independently and unconditionally every run,
-and rendered as its own dedicated email section rather than blended into
-the main price table's Source column - both so it's genuinely
-cross-checkable against the cascade's numbers, and because a source
-sitting at the bottom of a cascade can go permanently unexercised and
-unnoticed if everything above it already succeeds (which is exactly what
-happened the one time SSI was tried as a cascade fallback here). Field
-names for this endpoint aren't documented anywhere found, so several
-candidates are tried per value and a ticker is skipped rather than
-guessed if none match - worth a glance at DEBUG_EMPTY_RESPONSES output to
-sanity-check the parsed numbers look right. Being a domestic VN site
-(same category as CafeF/VNDirect above), it may also get rejected from
-cloud CI IPs - if so, its section just won't appear in the email that run.
+SSI is Vietnam's largest brokerage; this hits their real iBoard GraphQL
+API (not their official, auth-gated FastConnect Data API, which was
+deliberately not used here), queried once per exchange (hose/hnx/upcom -
+each call returns that whole exchange, filtered down to the watchlist).
+It's fetched independently and unconditionally every run, and rendered as
+its own dedicated email section rather than blended into the main price
+table's Source column - both so it's genuinely cross-checkable against
+the cascade's numbers, and because a source sitting at the bottom of a
+cascade can go permanently unexercised and unnoticed if everything above
+it already succeeds (which is exactly what happened the one time SSI was
+tried as a cascade fallback here). The GraphQL endpoint and exact field
+names (matchedPrice, refPrice, matchedVolume) were confirmed via a
+complete, runnable third-party script - an earlier REST-style endpoint
+this used to point to (from a 2023 write-up) turned out to be stale,
+silently returning SSI's app HTML shell instead of data or an error,
+which is what an outdated URL against a single-page app typically does.
+Being a domestic VN site (same category as CafeF/VNDirect above), it may
+still get rejected from cloud CI IPs - if so, its section just won't
+appear in the email that run.
 
 (FireAnt was tried as a source but dropped: its documented-looking
 endpoint 404s outright, and other people's write-ups of FireAnt's API note
@@ -261,7 +264,14 @@ TRADINGVIEW_SCAN_URL = "https://scanner.tradingview.com/scan"
 # a live test in this environment; if it turns out not to help either,
 # the generic endpoint is still tried second as-is.
 TRADINGVIEW_VIETNAM_SCAN_URL = "https://scanner.tradingview.com/vietnam/scan"
-SSI_ALL_STOCKS_URL = "https://iboard.ssi.com.vn/dchart/api/1.1/defaultAllStocks"
+# SSI's real current price-board API: confirmed via a complete, runnable
+# third-party script (not a blog description) that POSTs a GraphQL query
+# here and successfully parses the response. The older REST-style URL this
+# constant used to point to (dchart/api/1.1/defaultAllStocks, from a 2023
+# write-up) turned out to be stale - it silently returned SSI's app-shell
+# HTML instead of JSON or an error, meaning SSI has since moved their
+# iBoard data layer to GraphQL. See fetch_ssi_stock_prices() for the query.
+SSI_GRAPHQL_URL = "https://iboard.ssi.com.vn/gateway/graphql"
 CAFEF_HISTORY_URL = "https://s.cafef.vn/Ajax/PageNew/DataHistory/PriceHistory.ashx"
 VNDIRECT_QUOTES_URL = "https://finfo-api.vndirect.com.vn/v4/stock_prices"
 
@@ -304,16 +314,18 @@ CAFEF_HEADERS = dict(
     # before it will read the query string at all.
     **{"X-Requested-With": "XMLHttpRequest"},
 )
-# SSI's iBoard endpoint returned HTTP 200 with a completely empty body (not
-# even an error JSON, just zero bytes) when called with only generic
-# headers - same "looks successful, isn't" pattern as CafeF above before
-# its fix. Sending matching Referer/Origin/XHR headers to look like a real
-# request from the iBoard page itself.
+# Matches the exact headers used by the confirmed-working third-party
+# script this GraphQL query was sourced from - notably Accept: text/plain,
+# not application/json, which is what that script's server response
+# actually expects to be asked for. Referer/Origin added defensively (not
+# present in that script, but a safe, low-risk addition based on the
+# pattern that helped with CafeF).
 SSI_HEADERS = dict(
     HEADERS,
     Referer="https://iboard.ssi.com.vn/",
     Origin="https://iboard.ssi.com.vn",
-    **{"X-Requested-With": "XMLHttpRequest"},
+    Accept="text/plain",
+    **{"Content-Type": "application/json"},
 )
 REQUEST_TIMEOUT = 15
 DEBUG_EMPTY_RESPONSES = _env("DEBUG_EMPTY_RESPONSES") is not None
@@ -531,25 +543,63 @@ def fetch_tradingview_indices():
 # --- SSI iBoard (independent, always-run, not part of the cascade) -------------
 
 
+_SSI_STOCK_REALTIMES_QUERY = (
+    "query stockRealtimes($exchange: String) {\n"
+    "  stockRealtimes(exchange: $exchange) {\n"
+    "    stockSymbol\n"
+    "    matchedPrice\n"
+    "    refPrice\n"
+    "    matchedVolume\n"
+    "    nmTotalTradedQty\n"
+    "    __typename\n"
+    "  }\n"
+    "}\n"
+)
+
+
+def _fetch_ssi_exchange(exchange_lower):
+    """POSTs SSI's GraphQL stockRealtimes query for one exchange
+    ("hose"/"hnx"/"upcom") and returns the raw list of stock objects for
+    that exchange (the query has no per-ticker filter - it returns every
+    listed stock on that exchange in one response).
+    """
+    payload = {
+        "operationName": "stockRealtimes",
+        "variables": {"exchange": exchange_lower},
+        "query": _SSI_STOCK_REALTIMES_QUERY,
+    }
+    resp = requests.post(SSI_GRAPHQL_URL, headers=SSI_HEADERS, json=payload, timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    data = resp.json()
+    rows = ((data.get("data") or {}).get("stockRealtimes")) or []
+    if not rows and DEBUG_EMPTY_RESPONSES:
+        print(f"SSI empty response for exchange {exchange_lower}: {json.dumps(data)[:200]}")
+    return rows
+
+
 def fetch_ssi_stock_prices(tickers):
     """Returns {ticker: {"close": VND, "prev_close": VND|None, "volume": int}}.
 
-    Hits SSI's unofficial iBoard "all stocks" endpoint - reverse-engineered
-    from SSI's own public price-board webpage, documented by a third-party
-    write-up as a practice/learning API, NOT to be confused with SSI's
-    official FastConnect Data API (which requires registering for a
-    consumer ID/secret - a real auth-gated product, deliberately not used
-    here). One HTTP call returns the whole market, filtered down to the
-    requested tickers here rather than looked up individually.
+    Hits SSI's real iBoard GraphQL API at SSI_GRAPHQL_URL - confirmed via
+    a complete, runnable third-party script (not just a description), which
+    also confirmed the exact field names used below: stockSymbol,
+    matchedPrice (current price), refPrice (previous close - the exchange's
+    own reference price, used directly rather than derived), and
+    matchedVolume/nmTotalTradedQty for volume. NOT the official, auth-gated
+    FastConnect Data API (which requires a registered consumer ID/secret -
+    deliberately not used here).
 
-    Field names are best-effort: no official schema was found for this
-    endpoint, so several plausible candidates are tried per value and a
-    ticker is skipped entirely (not guessed) if none match. In production,
-    this endpoint returned HTTP 200 with a completely empty body when
-    called with only generic headers (same "looks successful, isn't"
-    pattern CafeF showed before its own header fix) - now sends matching
-    Referer/Origin/X-Requested-With headers (SSI_HEADERS) to look like a
-    real request from the iBoard page itself.
+    The query has no per-ticker filter, so it's called once per exchange
+    actually present in the requested tickers (via ticker_exchange()) - at
+    most 3 calls total (hose/hnx/upcom), each returning that whole
+    exchange's stocks, filtered down to the requested tickers here.
+
+    Price scale is assumed to already be plain VND (matching Yahoo/
+    TradingView/VNDirect), NOT thousand-VND (like CafeF/old-TCBS) - this
+    wasn't independently confirmed since the source script this was
+    pulled from just writes the raw value through without display
+    formatting. Check the DEBUG_EMPTY_RESPONSES sample-value log against a
+    known real price on the first run to confirm.
 
     Called independently, always, rather than as a STOCK_SOURCES cascade
     fallback - being a domestic VN site (same category as CafeF/VNDirect)
@@ -560,63 +610,30 @@ def fetch_ssi_stock_prices(tickers):
     is what happened the one time it *was* in the cascade).
     """
     result = {}
-    try:
-        resp = requests.get(SSI_ALL_STOCKS_URL, headers=SSI_HEADERS, timeout=REQUEST_TIMEOUT)
-    except Exception as e:
-        print(f"SSI fetch failed entirely (request error): {e}")
-        return result
-
-    try:
-        resp.raise_for_status()
-    except Exception as e:
-        print(f"SSI fetch failed entirely (HTTP error): {e}")
-        return result
-
-    try:
-        data = resp.json()
-    except Exception as e:
-        # A JSON decode failure on a 200 response usually means an empty or
-        # non-JSON body (e.g. a bot-detection layer returning nothing rather
-        # than an explicit error) - log what actually came back so this is
-        # diagnosable instead of just showing a cryptic decode error.
-        body_len = len(resp.content) if resp.content is not None else 0
-        snippet = resp.text[:200] if resp.text else "(empty body)"
-        print(
-            f"SSI fetch failed entirely (bad JSON, status={resp.status_code}, "
-            f"body_len={body_len}): {e} - body snippet: {snippet!r}"
-        )
-        return result
-
-    rows = data if isinstance(data, list) else (data.get("data") or data.get("Data") or [])
-    if not rows:
-        if DEBUG_EMPTY_RESPONSES:
-            snippet = json.dumps(data)[:200] if isinstance(data, (dict, list)) else str(data)[:200]
-            print(f"SSI empty response: {snippet}")
-        return result
-
     wanted = set(tickers)
-    for row in rows:
-        symbol = _first_present(row, ["stockSymbol", "symbol", "code", "Symbol", "StockSymbol"])
-        if symbol not in wanted:
+    needed_exchanges = sorted({ticker_exchange(t).lower() for t in tickers})
+
+    for exch in needed_exchanges:
+        try:
+            rows = _fetch_ssi_exchange(exch)
+        except Exception as e:
+            print(f"SSI fetch failed for exchange {exch}: {e}")
             continue
-        close = _first_present(
-            row, ["matchedPrice", "lastPrice", "closePrice", "close", "MatchedPrice", "ClosePrice"]
-        )
-        prev_close = _first_present(
-            row, ["priorClosePrice", "refPrice", "referencePrice", "basicPrice", "RefPrice", "PriorClosePrice"]
-        )
-        volume = _first_present(
-            row, ["totalVolume", "nmTotalTradedQty", "matchedVolume", "TotalVolume", "MatchedVolume"]
-        ) or 0
-        if close is None:
-            if DEBUG_EMPTY_RESPONSES:
-                print(f"SSI no recognized close field for {symbol}: keys={list(row.keys())}")
-            continue
-        result[symbol] = {
-            "close": float(close),
-            "prev_close": float(prev_close) if prev_close else None,
-            "volume": int(volume),
-        }
+
+        for row in rows:
+            symbol = row.get("stockSymbol")
+            if symbol not in wanted:
+                continue
+            close = row.get("matchedPrice")
+            if close is None:
+                continue
+            ref_price = row.get("refPrice")
+            volume = row.get("matchedVolume") or row.get("nmTotalTradedQty") or 0
+            result[symbol] = {
+                "close": float(close),
+                "prev_close": float(ref_price) if ref_price else None,
+                "volume": int(volume),
+            }
 
     if DEBUG_EMPTY_RESPONSES and result:
         sample_ticker = next(iter(result))
