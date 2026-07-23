@@ -11,8 +11,9 @@ Modeled on the same pattern as currency-rate-emailer / gold-price-emailer /
 tech-price-mailer: pulls from public sources, degrades gracefully if one
 fails, tracks state/history, and emails a summary.
 
-Stock/index prices come from two sources, tried in this order per ticker
-(first success wins for that ticker):
+Stock prices for the watchlist come from three sources, tried in this
+order per ticker (first success wins for that ticker); indices (VN-Index
+etc.) come from the first two only:
 
 1. Yahoo Finance (query1.finance.yahoo.com) - Vietnamese tickers are
    available there under a .VN suffix (e.g. VNM.VN, VCB.VN) and VN-Index
@@ -26,16 +27,30 @@ Stock/index prices come from two sources, tried in this order per ticker
    have an exchange mapping for defaults to HOSE. Confirmed in production
    to give full HOSE/HNX/UPCOM coverage via a Vietnam-scoped scanner
    endpoint (TRADINGVIEW_VIETNAM_SCAN_URL).
+3. MSN Finance (assets.msn.com / services.bingapis.com) - Microsoft-hosted,
+   same globally-hosted category as the two above. A two-step lookup:
+   Bing's finance autosuggest endpoint resolves a ticker to MSN's own
+   opaque instrument ID (cached to MSN_ID_CACHE_FILE after first
+   resolution, since that mapping never changes), then one batched call
+   to MSN's Quotes endpoint fetches live prices for every resolved ID.
+   Both endpoints and their exact response shapes - including a real
+   double-JSON-encoding quirk in the autosuggest response that would have
+   been very easy to get wrong - were confirmed via live requests during
+   development (a browser DevTools capture for Quotes, a direct fetch for
+   autosuggest), not guessed at.
 
-Both are globally-hosted infrastructure, confirmed reliable from GitHub
-Actions. Three domestic Vietnamese sources - CafeF, VNDirect, and SSI's
-iBoard - were also tried and each confirmed blocked from GitHub Actions'
-cloud IPs in a different way (CafeF: a fake-success empty response;
-VNDirect: connection timeout; SSI: 403 Forbidden) despite being correctly
-implemented against real, working endpoints. They were removed rather than
-kept as permanently-inert code; a proxy with residential/ISP IPs (not
-datacenter) would very likely be needed for a domestic VN source to work
-from a cloud CI runner - worth revisiting if that's ever set up.
+All three are globally-hosted infrastructure, confirmed reliable from
+GitHub Actions (Yahoo/TradingView in production; MSN not yet exercised in
+a real scheduled run at time of writing - worth checking test-sources
+output on the first one). Three domestic Vietnamese sources - CafeF,
+VNDirect, and SSI's iBoard - were also tried earlier and each confirmed
+blocked from GitHub Actions' cloud IPs in a different way (CafeF: a
+fake-success empty response; VNDirect: connection timeout; SSI: 403
+Forbidden) despite being correctly implemented against real, working
+endpoints. They were removed rather than kept as permanently-inert code;
+a proxy with residential/ISP IPs (not datacenter) would very likely be
+needed for a domestic VN source to work from a cloud CI runner - worth
+revisiting if that's ever set up.
 
 Neither Yahoo Finance nor TradingView are documented/versioned APIs -
 they're public JSON endpoints, the same category of caveat the
@@ -80,6 +95,7 @@ import sys
 import csv
 import json
 import smtplib
+import uuid
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from email.mime.text import MIMEText
@@ -229,6 +245,17 @@ TRADINGVIEW_SCAN_URL = "https://scanner.tradingview.com/scan"
 # universe rather than a curated cross-market subset. Confirmed in
 # production to give full HOSE/HNX/UPCOM coverage.
 TRADINGVIEW_VIETNAM_SCAN_URL = "https://scanner.tradingview.com/vietnam/scan"
+# MSN Money / Bing Finance - both endpoints and their exact response
+# shapes were confirmed via live requests during development (a browser
+# DevTools capture for Quotes, a direct fetch for the autosuggest one),
+# not guessed at. See fetch_msn_stock_prices() for details.
+MSN_AUTOSUGGEST_URL = "https://services.bingapis.com/contentservices-finance.csautosuggest/api/v1/Query"
+MSN_QUOTES_URL = "https://assets.msn.com/service/Finance/Quotes"
+# Public app key baked into MSN's own frontend JS (confirmed via browser
+# DevTools network capture against a real MSN Money page) - not a secret,
+# just an app identifier every visitor's browser already sends.
+MSN_API_KEY = "0QfOX3Vn51YCzitbLaRkTTBadtWpgTN8NZLW0C1SEM"
+MSN_ID_CACHE_FILE = "msn_id_cache.json"
 
 EMAIL_BODY_FILE = "email_body.txt"
 EMAIL_HTML_FILE = "email_body.html"
@@ -445,13 +472,180 @@ def fetch_tradingview_indices():
     return result
 
 
+# --- Source 3: MSN Finance -----------------------------------------------------
+
+
+def _load_msn_id_cache():
+    if not os.path.exists(MSN_ID_CACHE_FILE):
+        return {}
+    try:
+        with open(MSN_ID_CACHE_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_msn_id_cache(cache):
+    with open(MSN_ID_CACHE_FILE, "w") as f:
+        json.dump(cache, f)
+
+
+def _msn_resolve_instrument_id(ticker):
+    """Resolves a bare ticker (e.g. "VNM") to MSN's opaque internal
+    instrument ID (e.g. "aqk1a2") via Bing's finance autosuggest endpoint.
+
+    Confirmed response shape (via a live fetch during development, not a
+    guess): {"count": N, "data": {"stocks": ["<json-encoded-string>", ...]}}
+    - each element of "stocks" is itself a JSON *string*, not an object,
+    and needs a second json.loads() to reach fields like "SecId". Easy to
+    miss without seeing a real response - the API double-encodes.
+
+    Cross-checks the resolved result's own ticker field (RT00S) against
+    what was asked for, and returns None (skip, don't guess) if they
+    don't match - autosuggest is a "did you mean" endpoint, and the top
+    hit for an ambiguous query might be a company name match rather than
+    the exact ticker.
+    """
+    params = {"query": ticker, "market": "en-us", "count": 1}
+    resp = requests.get(MSN_AUTOSUGGEST_URL, headers=HEADERS, params=params, timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    data = resp.json()
+    stock_strings = ((data.get("data") or {}).get("stocks")) or []
+    if not stock_strings:
+        if DEBUG_EMPTY_RESPONSES:
+            print(f"MSN autosuggest empty response for {ticker}: {json.dumps(data)[:200]}")
+        return None
+    try:
+        stock = json.loads(stock_strings[0])
+    except Exception as e:
+        if DEBUG_EMPTY_RESPONSES:
+            print(f"MSN autosuggest unparseable inner JSON for {ticker}: {e}")
+        return None
+    resolved_symbol = stock.get("RT00S")
+    if resolved_symbol and resolved_symbol.upper() != ticker.upper():
+        if DEBUG_EMPTY_RESPONSES:
+            print(f"MSN autosuggest resolved {ticker} to a different symbol ({resolved_symbol}), skipping")
+        return None
+    return stock.get("SecId")
+
+
+def _msn_resolve_all(tickers):
+    """Resolves every ticker to an MSN instrument ID, using and updating a
+    small on-disk cache (MSN_ID_CACHE_FILE, committed back to the repo by
+    the workflow like last_prices.json/price_history.csv already are) so
+    this lookup - one HTTP call per *new* ticker - effectively only
+    happens once per ticker ever, not on every run. MSN's internal IDs
+    are stable for a given company, so caching them indefinitely is safe.
+    """
+    cache = _load_msn_id_cache()
+    changed = False
+    ids = {}
+    for ticker in tickers:
+        if ticker in cache:
+            ids[ticker] = cache[ticker]
+            continue
+        try:
+            instrument_id = _msn_resolve_instrument_id(ticker)
+        except Exception as e:
+            print(f"MSN ID resolution failed for {ticker}: {e}")
+            continue
+        if instrument_id:
+            ids[ticker] = instrument_id
+            cache[ticker] = instrument_id
+            changed = True
+        else:
+            print(f"MSN could not resolve an instrument ID for {ticker}")
+    if changed:
+        _save_msn_id_cache(cache)
+    return ids
+
+
+def _msn_fetch_quotes(instrument_ids):
+    """Batched quote fetch for a list of MSN instrument IDs - one HTTP
+    call covers all of them via a comma-separated ids= param. Confirmed
+    response shape via a live browser DevTools capture against a real MSN
+    Money page: a JSON array of quote objects, each including (among many
+    other fields) symbol, price, pricePreviousClose, accumulatedVolume.
+    """
+    if not instrument_ids:
+        return []
+    params = {
+        "apikey": MSN_API_KEY,
+        "activityId": str(uuid.uuid4()),
+        "ocid": "finance-utils-peregrine",
+        "cm": "en-us",
+        "it": "web",
+        "scn": "ANON",
+        "ids": ",".join(instrument_ids),
+        "wrapodata": "false",
+    }
+    resp = requests.get(MSN_QUOTES_URL, headers=HEADERS, params=params, timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    data = resp.json()
+    rows = data if isinstance(data, list) else []
+    if not rows and DEBUG_EMPTY_RESPONSES:
+        print(f"MSN quotes empty response: {json.dumps(data)[:200]}")
+    return rows
+
+
+def fetch_msn_stock_prices(tickers):
+    """Returns {ticker: {"close": VND, "prev_close": VND|None, "volume": int}}.
+
+    Two-step, since MSN's Quotes endpoint takes its own opaque instrument
+    IDs rather than ticker symbols: resolve each ticker to an ID (cached
+    after the first successful resolution - see _msn_resolve_all), then
+    one batched call to Quotes for every resolved ID. Confirmed against a
+    real Vietnamese ticker (VNM) during development: price is already in
+    plain VND (matches Yahoo/TradingView, not thousand-scaled like the
+    old CafeF/TCBS sources), and pricePreviousClose is the exchange's own
+    reference/previous-close price, used directly as prev_close.
+
+    MSN Money is Microsoft-hosted infrastructure (Bing/Azure), the same
+    globally-hosted category as Yahoo and TradingView - not a domestic VN
+    site, so it shouldn't hit the cloud-IP blocking that ruled out CafeF/
+    VNDirect/SSI.
+    """
+    result = {}
+    ids_by_ticker = _msn_resolve_all(tickers)
+    if not ids_by_ticker:
+        return result
+
+    id_to_ticker = {v: k for k, v in ids_by_ticker.items()}
+    try:
+        quotes = _msn_fetch_quotes(list(ids_by_ticker.values()))
+    except Exception as e:
+        print(f"MSN quotes fetch failed entirely: {e}")
+        return result
+
+    for q in quotes:
+        instrument_id = q.get("instrumentId") or q.get("_p")
+        ticker = id_to_ticker.get(instrument_id) or q.get("symbol")
+        if ticker not in ids_by_ticker:
+            continue
+        close = q.get("price")
+        if close is None:
+            continue
+        prev_close = q.get("pricePreviousClose")
+        volume = q.get("accumulatedVolume") or 0
+        result[ticker] = {
+            "close": float(close),
+            "prev_close": float(prev_close) if prev_close else None,
+            "volume": int(volume),
+        }
+    return result
+
+
 # --- Cascade across sources ----------------------------------------------------
 
 STOCK_SOURCES = [
     ("Yahoo Finance", fetch_yahoo_stock_prices),
     ("TradingView", fetch_tradingview_stock_prices),
+    ("MSN Finance", fetch_msn_stock_prices),
 ]
 
+# MSN Finance isn't part of INDEX_SOURCES: indices (VN-Index etc.) would
+# need their own confirmed MSN instrument IDs, which weren't looked into -
+# the stock-side integration above only covers individual tickers.
 INDEX_SOURCES = [
     ("Yahoo Finance", fetch_yahoo_indices),
     ("TradingView", fetch_tradingview_indices),
