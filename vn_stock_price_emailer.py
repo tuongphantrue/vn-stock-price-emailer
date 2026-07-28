@@ -928,6 +928,18 @@ def _html_escape(s):
 
 
 def format_email_html(prices, indices, used_source, previous_prices):
+    """Builds the HTML email body. Major sections (market indices, top
+    movers, each exchange's price table, weekly trend) are wrapped in
+    <details open> / <summary> so they're collapsible - native HTML5,
+    no JavaScript, since email clients strip scripts anyway. All default
+    to open, so nothing looks different on first view; the person reading
+    the email can then collapse whichever sections they don't want to
+    scroll past. Client support for the actual expand/collapse
+    interaction varies (works in Gmail's web client and Apple Mail, likely
+    not in Outlook desktop's Word-based renderer) - critically, the
+    fallback everywhere else is just "always shown, not collapsible",
+    never "content missing", so this degrades safely across clients.
+    """
     parts = []
     parts.append(f"""\
 <!DOCTYPE html>
@@ -971,9 +983,12 @@ def format_email_html(prices, indices, used_source, previous_prices):
             cells[-1] = cells[-1].replace(f"border-right:1px solid {_BORDER};", "")
         parts.append(f"""\
 <tr><td style="padding:20px 28px 4px 28px;">
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid {_BORDER};border-radius:8px;">
-    <tr>{''.join(cells)}</tr>
-  </table>
+  <details open>
+    <summary style="cursor:pointer;list-style:revert;font-size:13px;font-weight:700;color:{_NAVY};text-transform:uppercase;letter-spacing:0.04em;margin-bottom:8px;">Chỉ Số Thị Trường</summary>
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid {_BORDER};border-radius:8px;margin-top:8px;">
+      <tr>{''.join(cells)}</tr>
+    </table>
+  </details>
 </td></tr>
 """)
 
@@ -1001,7 +1016,10 @@ def format_email_html(prices, indices, used_source, previous_prices):
             )
         parts.append(f"""\
 <tr><td style="padding:16px 28px 4px 28px;">
-  {''.join(rows)}
+  <details open>
+    <summary style="cursor:pointer;list-style:revert;font-size:13px;font-weight:700;color:{_NAVY};text-transform:uppercase;letter-spacing:0.04em;margin-bottom:8px;">Biến Động Nổi Bật</summary>
+    <div style="margin-top:8px;">{''.join(rows)}</div>
+  </details>
 </td></tr>
 """)
 
@@ -1031,20 +1049,22 @@ def format_email_html(prices, indices, used_source, previous_prices):
 </tr>""")
 
         exchange_sections.append(f"""\
-  <div style="margin:16px 0 8px 0;">
-    <span style="display:inline-block;padding:2px 9px;border-radius:5px;background:{_NAVY};color:#ffffff;font-size:11px;font-weight:700;letter-spacing:0.04em;">{exch}</span>
-    <span style="font-size:12px;color:{_GRAY};margin-left:6px;">{len(tickers)} mã</span>
-  </div>
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid {_BORDER};border-radius:8px;overflow:hidden;font-size:14px;">
-    <tr style="background:#f8fafc;">
-      <th align="left" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Mã CK</th>
-      <th align="right" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Giá đóng cửa (VNĐ)</th>
-      <th align="center" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Thay đổi</th>
-      <th align="right" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Khối lượng</th>
-      <th align="right" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Nguồn</th>
-    </tr>
-    {''.join(row_html)}
-  </table>""")
+  <details open style="margin:16px 0 8px 0;">
+    <summary style="cursor:pointer;list-style:revert;">
+      <span style="display:inline-block;padding:2px 9px;border-radius:5px;background:{_NAVY};color:#ffffff;font-size:11px;font-weight:700;letter-spacing:0.04em;">{exch}</span>
+      <span style="font-size:12px;color:{_GRAY};margin-left:6px;">{len(tickers)} mã</span>
+    </summary>
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid {_BORDER};border-radius:8px;overflow:hidden;font-size:14px;margin-top:8px;">
+      <tr style="background:#f8fafc;">
+        <th align="left" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Mã CK</th>
+        <th align="right" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Giá đóng cửa (VNĐ)</th>
+        <th align="center" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Thay đổi</th>
+        <th align="right" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Khối lượng</th>
+        <th align="right" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Nguồn</th>
+      </tr>
+      {''.join(row_html)}
+    </table>
+  </details>""")
 
     parts.append(f"""\
 <tr><td style="padding:20px 28px 4px 28px;">
@@ -1066,8 +1086,10 @@ def format_email_html(prices, indices, used_source, previous_prices):
             )
         parts.append(f"""\
 <tr><td style="padding:20px 28px 4px 28px;">
-  <div style="font-size:13px;font-weight:700;color:{_NAVY};text-transform:uppercase;letter-spacing:0.04em;margin-bottom:8px;">Xu Hướng Tuần (Thay Đổi 7 Ngày)</div>
-  {''.join(trend_rows)}
+  <details open>
+    <summary style="cursor:pointer;list-style:revert;font-size:13px;font-weight:700;color:{_NAVY};text-transform:uppercase;letter-spacing:0.04em;margin-bottom:8px;">Xu Hướng Tuần (Thay Đổi 7 Ngày)</summary>
+    <div style="margin-top:8px;">{''.join(trend_rows)}</div>
+  </details>
 </td></tr>
 """)
 
