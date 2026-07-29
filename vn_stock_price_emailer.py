@@ -914,6 +914,60 @@ def weekly_trend_data():
     return result if result else None  # None = not enough history yet
 
 
+# --- Price sparklines ----------------------------------------------------------
+
+SPARKLINE_MAX_POINTS = 12
+_SPARK_CHARS = "▁▂▃▄▅▆▇█"  # 8 levels, low to high
+
+
+def load_all_ticker_histories(max_points=SPARKLINE_MAX_POINTS):
+    """Reads price_history.csv once and returns {ticker: [closes...]}
+    (oldest -> newest, capped at the most recent max_points per ticker).
+    A single pass over the file rather than re-scanning it per ticker,
+    since this gets called once per email and the watchlist can be 250+
+    tickers now.
+    """
+    histories = {}
+    if not os.path.exists(HISTORY_FILE):
+        return histories
+    with open(HISTORY_FILE) as f:
+        for row in csv.DictReader(f):
+            ticker = row.get("ticker")
+            try:
+                ts = row["timestamp"]
+                close = float(row["close"])
+            except (ValueError, KeyError, TypeError):
+                continue
+            histories.setdefault(ticker, []).append((ts, close))
+
+    result = {}
+    for ticker, points in histories.items():
+        points.sort(key=lambda p: p[0])
+        result[ticker] = [c for _, c in points[-max_points:]]
+    return result
+
+
+def sparkline_text(closes):
+    """Returns a compact Unicode block-character sparkline (e.g. "▂▃▅▄▇█▆")
+    showing the shape of recent closes, normalized to their own min/max -
+    not colored here, since this same string is shared by the plain-text
+    email (no color) and wrapped in a colored <span> for the HTML one.
+    Returns "" if there aren't at least 2 points to show a shape.
+
+    Chosen deliberately over an HTML/CSS bar chart (a small table of
+    colored cells per row): at 250+ tickers, one such table per row would
+    add several hundred KB to the email and risk tripping Gmail's
+    clipping threshold - a short text string costs almost nothing by
+    comparison, and Unicode block characters are broadly supported by
+    system fonts across every major platform.
+    """
+    if len(closes) < 2:
+        return ""
+    lo, hi = min(closes), max(closes)
+    span = (hi - lo) or 1  # avoid divide-by-zero when every point is flat
+    return "".join(_SPARK_CHARS[min(7, int((c - lo) / span * 8))] for c in closes)
+
+
 # --- Gainers / losers ---------------------------------------------------------
 
 
@@ -984,10 +1038,11 @@ def format_email_body(prices, indices, used_source, previous_prices):
             lines.append("Giảm: " + ", ".join(f"{t} {p:+.2f}%" for t, p in losers))
         lines.append("")
 
+    histories = load_all_ticker_histories()
     for exch, tickers in watchlist_by_exchange().items():
         lines.append(f"Giá đóng cửa - {exch}")
-        lines.append(f"{'Mã CK':<8}{'Giá đóng cửa (VNĐ)':<22}{'Thay đổi':<14}{'Khối lượng':<16}{'Nguồn'}")
-        lines.append("-" * 68)
+        lines.append(f"{'Mã CK':<8}{'Giá đóng cửa (VNĐ)':<22}{'Thay đổi':<14}{'Khối lượng':<16}{'Xu hướng':<14}{'Nguồn'}")
+        lines.append("-" * 82)
         for ticker in tickers:
             vals = prices.get(ticker)
             if not vals:
@@ -995,9 +1050,10 @@ def format_email_body(prices, indices, used_source, previous_prices):
                 continue
             pct = _pct_change(vals)
             change_str = f"{_pct_arrow_word(pct)} {pct:+.2f}%" if pct is not None else ""
+            spark = sparkline_text(histories.get(ticker, []))
             lines.append(
                 f"{ticker:<8}{vals['close']:,.0f}{'':<12}{change_str:<14}"
-                f"{vals.get('volume', 0):,.0f}{'':<10}{used_source.get(ticker, '?')}"
+                f"{vals.get('volume', 0):,.0f}{'':<10}{spark:<14}{used_source.get(ticker, '?')}"
             )
         lines.append("")
 
@@ -1154,6 +1210,7 @@ def format_email_html(prices, indices, used_source, previous_prices):
 """)
 
     # --- Price table, grouped by exchange ---
+    histories = load_all_ticker_histories()
     exchange_sections = []
     for exch, tickers in watchlist_by_exchange().items():
         row_html = []
@@ -1164,11 +1221,18 @@ def format_email_html(prices, indices, used_source, previous_prices):
                 row_html.append(f"""\
 <tr style="background:{stripe};">
   <td style="padding:10px 12px;font-weight:700;color:{_NAVY};">{_html_escape(ticker)}</td>
-  <td colspan="4" style="padding:10px 12px;color:{_GRAY};font-size:13px;">không có dữ liệu lần này</td>
+  <td colspan="5" style="padding:10px 12px;color:{_GRAY};font-size:13px;">không có dữ liệu lần này</td>
 </tr>""")
                 continue
             pct = _pct_change(vals)
             source = used_source.get(ticker, "?")
+            closes = histories.get(ticker, [])
+            spark = sparkline_text(closes)
+            if spark:
+                spark_color = _GREEN if closes[-1] >= closes[0] else _RED
+                spark_html = f'<span style="color:{spark_color};font-size:14px;letter-spacing:1px;">{spark}</span>'
+            else:
+                spark_html = f'<span style="color:{_GRAY};">\u2013</span>'
             row_html.append(f"""\
 <tr style="background:{stripe};">
   <td style="padding:10px 12px;font-weight:700;color:{_NAVY};">{_html_escape(ticker)}</td>
@@ -1176,6 +1240,7 @@ def format_email_html(prices, indices, used_source, previous_prices):
   <td style="padding:10px 12px;text-align:center;">{_change_badge(pct)}</td>
   <td style="padding:10px 12px;text-align:right;color:{_GRAY};font-size:13px;font-variant-numeric:tabular-nums;">{vals.get('volume', 0):,.0f}</td>
   <td style="padding:10px 12px;text-align:right;color:{_GRAY};font-size:11px;">{_html_escape(source)}</td>
+  <td style="padding:10px 12px;text-align:center;white-space:nowrap;">{spark_html}</td>
 </tr>""")
 
         exchange_sections.append(f"""\
@@ -1190,6 +1255,7 @@ def format_email_html(prices, indices, used_source, previous_prices):
       <th align="center" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Thay đổi</th>
       <th align="right" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Khối lượng</th>
       <th align="right" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Nguồn</th>
+      <th align="center" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Xu Hướng</th>
     </tr>
     {''.join(row_html)}
   </table>""")
