@@ -1,20 +1,30 @@
 # vn-stock-price-emailer
 
-Emails a daily summary of a Vietnam stock watchlist (HOSE/HNX/UPCOM tickers)
+Emails a summary of Vietnam's top stocks by market cap (HOSE/HNX/UPCOM)
 plus VN-Index / HNX-Index / UPCOM-Index, in Vietnamese, as a styled HTML
 email. Same shape as its siblings
 [currency-rate-emailer](https://github.com/tuongphantrue/currency-rate-emailer),
 [gold-price-emailer](https://github.com/tuongphantrue/gold-price-emailer), and
 [tech-price-mailer](https://github.com/tuongphantrue/tech-price-mailer): runs
-on GitHub Actions on a schedule, no server to keep on, pulls from a couple
-of independent free sources and degrades gracefully if one is down.
+on GitHub Actions on a schedule, no server to keep on, pulls from a few
+independent free sources and degrades gracefully if one is down.
 
 ## What it does
 
-- Fetches closing prices for a 56-ticker watchlist across all three
-  Vietnamese exchanges (HOSE, HNX, UPCOM) from two independent sources -
-  **Yahoo Finance -> TradingView** - first source to answer for a given
-  ticker wins; a block on one doesn't take out the other
+- Tracks the **top 250 Vietnamese stocks by market cap** (configurable via
+  `TOP_N_STOCKS`) across all three exchanges, resolved dynamically each
+  day via TradingView's scanner - not a hand-typed static list, so it
+  stays accurate as rankings shift and doesn't need manual updates when a
+  company migrates exchanges (HNX's ~299 listed stocks are being
+  transferred to HOSE by the end of 2026 under a market restructuring, for
+  instance - a dynamic lookup just reflects wherever a stock currently is)
+- Fetches closing prices from a cascade of three independent sources -
+  **TradingView -> Yahoo Finance -> MSN Finance** - first source to
+  answer for a given ticker wins; a block on one doesn't take out the
+  rest. TradingView goes first since it can fetch the whole watchlist in
+  one batched call; Yahoo (one request per ticker) and MSN only pick up
+  whatever TradingView misses, keeping their request volume low even at
+  250+ tickers
 - Pulls VN-Index / HNX-Index / UPCOM-Index levels
 - Groups the price table by exchange (HOSE / HNX / UPCOM), each with its
   own section
@@ -25,16 +35,30 @@ of independent free sources and degrades gracefully if one is down.
 - A `test-sources` diagnostic command that exercises every source
   independently, bypassing the normal "only call what's still missing"
   cascade logic, so you can check a source's health even when it would
-  otherwise never get called (e.g. Yahoo already covering everything)
+  otherwise never get called
+
+## How the watchlist is determined
+
+1. **`WATCHLIST` env var, if set** - a full manual override (comma-separated
+   tickers), unchanged from earlier versions of this script.
+2. **Otherwise, a live top-N-by-market-cap query** against TradingView,
+   cached to `watchlist_cache.json` for 24 hours (market-cap rankings
+   don't meaningfully shift run-to-run, so there's no reason to re-query
+   every 30 minutes). A few specific tickers (currently just `YEG`) are
+   always included regardless of the cutoff, since they were added by
+   explicit request rather than a market-cap ranking.
+3. **If that query fails and there's no usable cache**, falls back to a
+   curated ~56-ticker list baked into the script, so a TradingView hiccup
+   degrades to "the old watchlist" rather than "no watchlist at all."
 
 ## Important caveats
 
-Neither Yahoo Finance nor TradingView are documented, versioned, or
-guaranteed APIs - they're public JSON endpoints behind each provider's own
-app, reverse-engineered rather than officially supported. They can change
-shape, rate-limit, or block traffic without notice. Treat this as a
-personal watchlist/notification tool, not a trading system - always
-confirm prices with your broker before acting on them.
+None of TradingView, Yahoo Finance, or MSN Finance are documented,
+versioned, or guaranteed APIs - they're public JSON endpoints behind each
+provider's own app, reverse-engineered rather than officially supported.
+They can change shape, rate-limit, or block traffic without notice. Treat
+this as a personal watchlist/notification tool, not a trading system -
+always confirm prices with your broker before acting on them.
 
 Three domestic Vietnamese sources - CafeF, VNDirect, and SSI's iBoard -
 were also tried and removed. Each was confirmed blocked from GitHub
@@ -55,7 +79,8 @@ runner; not something this version of the script attempts.
    - `STOCK_RECIPIENT` -- recipient email address
 3. Optionally add repo **variables** (same page, Variables tab) to
    override defaults:
-   - `WATCHLIST` -- comma-separated tickers, overrides the built-in 56-ticker default entirely
+   - `WATCHLIST` -- comma-separated tickers, bypasses the dynamic top-N lookup entirely
+   - `TOP_N_STOCKS` -- how many stocks to track when `WATCHLIST` isn't set (default `250`)
    - `ALERT_THRESHOLD_PERCENT` -- only email if some stock moved >= this % (leave unset to always send)
    - `DEBUG_EMPTY_RESPONSES` -- set to `1` to log the actual HTTP status/body when a source returns nothing, instead of failing silently
 4. The workflow runs on the schedule in
