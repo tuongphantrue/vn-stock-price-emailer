@@ -356,14 +356,18 @@ def resolve_watchlist():
 
 
 def watchlist_by_exchange():
-    """Groups WATCHLIST tickers by exchange, in EXCHANGE_ORDER, skipping
+    """Groups WATCHLIST tickers by exchange, in EXCHANGE_ORDER, sorted
+    alphabetically by ticker within each exchange (not market-cap order,
+    which is how WATCHLIST itself is ordered when resolved dynamically -
+    this only affects display order in the price tables, not WATCHLIST
+    itself, so things like weekly_trend_data() are unaffected). Skips
     exchanges with no tickers. Used to render the email's price table as
     separate per-exchange sections instead of one flat list.
     """
     groups = {exch: [] for exch in EXCHANGE_ORDER}
     for ticker in WATCHLIST:
         groups[ticker_exchange(ticker)].append(ticker)
-    return {exch: tickers for exch, tickers in groups.items() if tickers}
+    return {exch: sorted(tickers) for exch, tickers in groups.items() if tickers}
 
 INDICES = [
     ("VNINDEX", "VN-Index"),
