@@ -82,7 +82,11 @@ Required environment variables (set as GitHub Actions secrets, or export locally
     STOCK_RECIPIENT     - recipient email address
 
 Optional environment variables:
-    WATCHLIST                - comma-separated tickers, default below
+    WATCHLIST                - comma-separated tickers, full manual override. If unset,
+                                the watchlist is instead the top TOP_N_STOCKS Vietnamese
+                                stocks by market cap (see resolve_watchlist() below)
+    TOP_N_STOCKS             - how many stocks to track when WATCHLIST isn't set
+                                (default 250)
     ALERT_THRESHOLD_PERCENT  - only send if some stock moved >= this % since last run
                                 (leave unset to always send)
     DEBUG_EMPTY_RESPONSES    - set to any non-empty value to log the actual HTTP
@@ -131,7 +135,22 @@ def format_vn_datetime(dt):
     return f"{weekday}, {dt.day:02d} {month} {dt.year} - {dt.strftime('%H:%M')}"
 
 
-DEFAULT_WATCHLIST_BY_EXCHANGE = {
+def _env(name, default=None):
+    """os.environ.get, but treats an unset-but-present GitHub Actions
+    variable (which comes through as an empty string, not a missing key)
+    the same as truly unset.
+    """
+    val = os.environ.get(name)
+    if val is None or val.strip() == "":
+        return default
+    return val
+
+
+# Used only as a last-resort safety net (see resolve_watchlist() below) if
+# the dynamic top-N-by-market-cap lookup fails AND no cached result exists
+# either - this used to be THE watchlist; now it's what keeps the tool
+# from ending up with an empty one just because a live query had a bad day.
+FALLBACK_WATCHLIST_BY_EXCHANGE = {
     "HOSE": [
         # Banking
         "VCB", "TCB", "MBB", "BID", "CTG", "ACB", "VPB", "STB", "HDB", "TPB",
@@ -181,18 +200,35 @@ DEFAULT_WATCHLIST_BY_EXCHANGE = {
 # Exchange order used consistently for display grouping throughout the email.
 EXCHANGE_ORDER = ["HOSE", "HNX", "UPCOM"]
 
-DEFAULT_WATCHLIST = [
-    t for exch in EXCHANGE_ORDER for t in DEFAULT_WATCHLIST_BY_EXCHANGE[exch]
-]
-
-# ticker -> exchange, built from the same source of truth as the default
-# watchlist above. A custom ticker added via the WATCHLIST env var that
-# isn't in this map falls back to "HOSE" (see ticker_exchange() below) -
-# true for the large majority of actively-traded VN tickers, but worth
-# double-checking if you add an HNX/UPCOM-only name yourself.
-TICKER_EXCHANGE = {
-    t: exch for exch, tickers in DEFAULT_WATCHLIST_BY_EXCHANGE.items() for t in tickers
+FALLBACK_TICKER_EXCHANGE = {
+    t: exch for exch, tickers in FALLBACK_WATCHLIST_BY_EXCHANGE.items() for t in tickers
 }
+
+# Tickers to always include regardless of the market-cap cutoff below -
+# added by specific request rather than a market-cap ranking (e.g. YEG, a
+# smaller media company that wouldn't otherwise make a top-250 cut).
+EXPLICIT_EXTRA_TICKERS = {"YEG": "HOSE"}
+
+# How many of Vietnam's ~1,600 listed companies to track, ranked by market
+# cap - "significant expansion, not everything" per an explicit choice to
+# avoid the real risks of the full ~1,600 (Yahoo Finance rate-limiting
+# risk from ~1,600 sequential per-ticker requests chief among them).
+TOP_N_STOCKS = int(_env("TOP_N_STOCKS", "250"))
+
+WATCHLIST_CACHE_FILE = "watchlist_cache.json"
+# Market-cap rankings don't meaningfully shift run-to-run - re-querying
+# TradingView every 30 minutes for something that's genuinely stable
+# day-to-day would be wasteful and adds needless risk to every run. Cached
+# for a day; refreshed automatically once the cache is older than this.
+WATCHLIST_CACHE_MAX_AGE_HOURS = 24
+
+# WATCHLIST and TICKER_EXCHANGE start as the static fallback here, and get
+# overwritten by resolve_watchlist() - called first thing in cmd_generate()
+# and cmd_test_sources() - unless the WATCHLIST env var is explicitly set,
+# in which case that's used directly (unchanged from previous versions of
+# this script) and the dynamic lookup is skipped entirely.
+WATCHLIST = [t for exch in EXCHANGE_ORDER for t in FALLBACK_WATCHLIST_BY_EXCHANGE[exch]]
+TICKER_EXCHANGE = dict(FALLBACK_TICKER_EXCHANGE)
 
 
 def ticker_exchange(ticker):
@@ -203,19 +239,120 @@ def ticker_exchange(ticker):
     return TICKER_EXCHANGE.get(ticker, "HOSE")
 
 
-def _env(name, default=None):
-    """os.environ.get, but treats an unset-but-present GitHub Actions
-    variable (which comes through as an empty string, not a missing key)
-    the same as truly unset.
+def _load_watchlist_cache():
+    """Returns {ticker: exchange} from WATCHLIST_CACHE_FILE if it exists
+    and isn't older than WATCHLIST_CACHE_MAX_AGE_HOURS, else None (meaning
+    "needs a fresh lookup").
     """
-    val = os.environ.get(name)
-    if val is None or val.strip() == "":
-        return default
-    return val
+    if not os.path.exists(WATCHLIST_CACHE_FILE):
+        return None
+    try:
+        with open(WATCHLIST_CACHE_FILE) as f:
+            data = json.load(f)
+        cached_at = datetime.fromisoformat(data["cached_at"])
+        age_hours = (now_vn() - cached_at).total_seconds() / 3600
+        if age_hours > WATCHLIST_CACHE_MAX_AGE_HOURS:
+            return None
+        return data["tickers"]
+    except Exception:
+        return None
 
 
-WATCHLIST = _env("WATCHLIST", ",".join(DEFAULT_WATCHLIST)).split(",")
-WATCHLIST = [t.strip().upper() for t in WATCHLIST if t.strip()]
+def _save_watchlist_cache(tickers_by_exchange):
+    with open(WATCHLIST_CACHE_FILE, "w") as f:
+        json.dump({"cached_at": now_vn().isoformat(), "tickers": tickers_by_exchange}, f)
+
+
+def fetch_top_n_by_market_cap(n):
+    """Queries TradingView's Vietnam-scoped scanner for the top n
+    Vietnamese stocks by market cap across HOSE/HNX/UPCOM, sorted
+    descending. Unlike the per-ticker lookups elsewhere in this file, this
+    doesn't need to know tickers in advance - an empty "tickers" list
+    combined with a "sort" on market_cap_basic and a "range" is how you
+    ask TradingView's scanner for a ranked list instead of specific
+    symbols. Confirmed via an open-source screener library's documented
+    default query shape (the same shner-elmo/TradingView-Screener project
+    that confirmed market="vietnam" support and the HOSE:VIX example used
+    elsewhere in this file).
+
+    Returns {ticker: exchange}, parsed from each result row's "s" field
+    (e.g. "HOSE:VNM" -> ticker "VNM", exchange "HOSE") - the same
+    qualified-symbol format _tradingview_scan() already parses elsewhere.
+    """
+    payload = {
+        "markets": ["vietnam"],
+        "symbols": {"query": {"types": ["stock"]}, "tickers": []},
+        "columns": ["name"],
+        "sort": {"sortBy": "market_cap_basic", "sortOrder": "desc"},
+        "range": [0, n],
+    }
+    resp = requests.post(
+        TRADINGVIEW_VIETNAM_SCAN_URL, headers=HEADERS, json=payload, timeout=REQUEST_TIMEOUT
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    rows = data.get("data") or []
+    if not rows and DEBUG_EMPTY_RESPONSES:
+        print(f"Top-N-by-market-cap empty response: {json.dumps(data)[:200]}")
+
+    result = {}
+    for row in rows:
+        qualified = row.get("s", "")
+        if ":" not in qualified:
+            continue
+        exch, ticker = qualified.split(":", 1)
+        result[ticker] = exch
+    return result
+
+
+def resolve_watchlist():
+    """Determines the actual watchlist + ticker-exchange mapping for this
+    run, and updates the module-level WATCHLIST/TICKER_EXCHANGE that the
+    rest of this file reads. Must be called before anything else that
+    depends on WATCHLIST - first thing in cmd_generate() and
+    cmd_test_sources(). Priority:
+
+    1. WATCHLIST env var, if set - full manual override, unchanged
+       behavior from previous versions of this script.
+    2. A cached top-N-by-market-cap result, if one exists and isn't stale
+       (see WATCHLIST_CACHE_MAX_AGE_HOURS) - avoids re-querying
+       TradingView every run for something that doesn't change day to day.
+    3. A fresh top-N-by-market-cap query (see fetch_top_n_by_market_cap),
+       unioned with EXPLICIT_EXTRA_TICKERS, then cached for next time.
+    4. FALLBACK_WATCHLIST_BY_EXCHANGE (the original ~56-ticker curated
+       list) if the query fails and there's no usable cache - so a
+       TradingView hiccup degrades to "the old watchlist" rather than
+       "no watchlist at all".
+    """
+    global WATCHLIST, TICKER_EXCHANGE
+
+    env_override = _env("WATCHLIST")
+    if env_override:
+        WATCHLIST = [t.strip().upper() for t in env_override.split(",") if t.strip()]
+        TICKER_EXCHANGE = dict(FALLBACK_TICKER_EXCHANGE)
+        return
+
+    cached = _load_watchlist_cache()
+    if cached:
+        TICKER_EXCHANGE = cached
+        WATCHLIST = list(cached.keys())
+        return
+
+    try:
+        ranked = fetch_top_n_by_market_cap(TOP_N_STOCKS)
+    except Exception as e:
+        print(f"Top-N-by-market-cap lookup failed ({e}), falling back to the curated default watchlist.")
+        ranked = {}
+
+    if ranked:
+        merged = dict(ranked)
+        merged.update(EXPLICIT_EXTRA_TICKERS)
+        TICKER_EXCHANGE = merged
+        WATCHLIST = list(merged.keys())
+        _save_watchlist_cache(merged)
+    else:
+        TICKER_EXCHANGE = dict(FALLBACK_TICKER_EXCHANGE)
+        WATCHLIST = [t for exch in EXCHANGE_ORDER for t in FALLBACK_WATCHLIST_BY_EXCHANGE[exch]]
 
 
 def watchlist_by_exchange():
@@ -638,8 +775,8 @@ def fetch_msn_stock_prices(tickers):
 # --- Cascade across sources ----------------------------------------------------
 
 STOCK_SOURCES = [
-    ("Yahoo Finance", fetch_yahoo_stock_prices),
     ("TradingView", fetch_tradingview_stock_prices),
+    ("Yahoo Finance", fetch_yahoo_stock_prices),
     ("MSN Finance", fetch_msn_stock_prices),
 ]
 
@@ -647,8 +784,8 @@ STOCK_SOURCES = [
 # need their own confirmed MSN instrument IDs, which weren't looked into -
 # the stock-side integration above only covers individual tickers.
 INDEX_SOURCES = [
-    ("Yahoo Finance", fetch_yahoo_indices),
     ("TradingView", fetch_tradingview_indices),
+    ("Yahoo Finance", fetch_yahoo_indices),
 ]
 
 
@@ -928,17 +1065,14 @@ def _html_escape(s):
 
 
 def format_email_html(prices, indices, used_source, previous_prices):
-    """Builds the HTML email body. Major sections (market indices, top
-    movers, each exchange's price table, weekly trend) are wrapped in
-    <details open> / <summary> so they're collapsible - native HTML5,
-    no JavaScript, since email clients strip scripts anyway. All default
-    to open, so nothing looks different on first view; the person reading
-    the email can then collapse whichever sections they don't want to
-    scroll past. Client support for the actual expand/collapse
-    interaction varies (works in Gmail's web client and Apple Mail, likely
-    not in Outlook desktop's Word-based renderer) - critically, the
-    fallback everywhere else is just "always shown, not collapsible",
-    never "content missing", so this degrades safely across clients.
+    """Builds the HTML email body.
+
+    Collapsible sections via <details>/<summary> were tried here at one
+    point (no JavaScript needed, since email clients strip scripts
+    anyway) but confirmed non-functional in Gmail's web client - clicking
+    a section header did nothing, not even the native disclosure
+    triangle rendered. Reverted back to plain, non-interactive headers
+    rather than leave dead "looks clickable but isn't" markup in place.
     """
     parts = []
     parts.append(f"""\
@@ -983,12 +1117,10 @@ def format_email_html(prices, indices, used_source, previous_prices):
             cells[-1] = cells[-1].replace(f"border-right:1px solid {_BORDER};", "")
         parts.append(f"""\
 <tr><td style="padding:20px 28px 4px 28px;">
-  <details open>
-    <summary style="cursor:pointer;list-style:revert;font-size:13px;font-weight:700;color:{_NAVY};text-transform:uppercase;letter-spacing:0.04em;margin-bottom:8px;">Chỉ Số Thị Trường</summary>
-    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid {_BORDER};border-radius:8px;margin-top:8px;">
-      <tr>{''.join(cells)}</tr>
-    </table>
-  </details>
+  <div style="font-size:13px;font-weight:700;color:{_NAVY};text-transform:uppercase;letter-spacing:0.04em;margin-bottom:8px;">Chỉ Số Thị Trường</div>
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid {_BORDER};border-radius:8px;">
+    <tr>{''.join(cells)}</tr>
+  </table>
 </td></tr>
 """)
 
@@ -1016,10 +1148,8 @@ def format_email_html(prices, indices, used_source, previous_prices):
             )
         parts.append(f"""\
 <tr><td style="padding:16px 28px 4px 28px;">
-  <details open>
-    <summary style="cursor:pointer;list-style:revert;font-size:13px;font-weight:700;color:{_NAVY};text-transform:uppercase;letter-spacing:0.04em;margin-bottom:8px;">Biến Động Nổi Bật</summary>
-    <div style="margin-top:8px;">{''.join(rows)}</div>
-  </details>
+  <div style="font-size:13px;font-weight:700;color:{_NAVY};text-transform:uppercase;letter-spacing:0.04em;margin-bottom:8px;">Biến Động Nổi Bật</div>
+  {''.join(rows)}
 </td></tr>
 """)
 
@@ -1049,22 +1179,20 @@ def format_email_html(prices, indices, used_source, previous_prices):
 </tr>""")
 
         exchange_sections.append(f"""\
-  <details open style="margin:16px 0 8px 0;">
-    <summary style="cursor:pointer;list-style:revert;">
-      <span style="display:inline-block;padding:2px 9px;border-radius:5px;background:{_NAVY};color:#ffffff;font-size:11px;font-weight:700;letter-spacing:0.04em;">{exch}</span>
-      <span style="font-size:12px;color:{_GRAY};margin-left:6px;">{len(tickers)} mã</span>
-    </summary>
-    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid {_BORDER};border-radius:8px;overflow:hidden;font-size:14px;margin-top:8px;">
-      <tr style="background:#f8fafc;">
-        <th align="left" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Mã CK</th>
-        <th align="right" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Giá đóng cửa (VNĐ)</th>
-        <th align="center" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Thay đổi</th>
-        <th align="right" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Khối lượng</th>
-        <th align="right" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Nguồn</th>
-      </tr>
-      {''.join(row_html)}
-    </table>
-  </details>""")
+  <div style="margin:16px 0 8px 0;">
+    <span style="display:inline-block;padding:2px 9px;border-radius:5px;background:{_NAVY};color:#ffffff;font-size:11px;font-weight:700;letter-spacing:0.04em;">{exch}</span>
+    <span style="font-size:12px;color:{_GRAY};margin-left:6px;">{len(tickers)} mã</span>
+  </div>
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid {_BORDER};border-radius:8px;overflow:hidden;font-size:14px;">
+    <tr style="background:#f8fafc;">
+      <th align="left" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Mã CK</th>
+      <th align="right" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Giá đóng cửa (VNĐ)</th>
+      <th align="center" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Thay đổi</th>
+      <th align="right" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Khối lượng</th>
+      <th align="right" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Nguồn</th>
+    </tr>
+    {''.join(row_html)}
+  </table>""")
 
     parts.append(f"""\
 <tr><td style="padding:20px 28px 4px 28px;">
@@ -1086,10 +1214,8 @@ def format_email_html(prices, indices, used_source, previous_prices):
             )
         parts.append(f"""\
 <tr><td style="padding:20px 28px 4px 28px;">
-  <details open>
-    <summary style="cursor:pointer;list-style:revert;font-size:13px;font-weight:700;color:{_NAVY};text-transform:uppercase;letter-spacing:0.04em;margin-bottom:8px;">Xu Hướng Tuần (Thay Đổi 7 Ngày)</summary>
-    <div style="margin-top:8px;">{''.join(trend_rows)}</div>
-  </details>
+  <div style="font-size:13px;font-weight:700;color:{_NAVY};text-transform:uppercase;letter-spacing:0.04em;margin-bottom:8px;">Xu Hướng Tuần (Thay Đổi 7 Ngày)</div>
+  {''.join(trend_rows)}
 </td></tr>
 """)
 
@@ -1141,6 +1267,9 @@ def send_email(text_body, html_body=None):
 
 
 def cmd_generate():
+    resolve_watchlist()
+    print(f"Watchlist resolved: {len(WATCHLIST)} tickers")
+
     prices, used_source = fetch_all_stock_prices()
 
     if not prices:
@@ -1205,10 +1334,11 @@ def cmd_test_sources():
     independently for the full watchlist, regardless of whether an earlier
     source in the cascade already covered a given ticker. The normal
     'generate' run only calls a source for gaps the previous ones left, so
-    a source that's fully redundant on a given day (e.g. Yahoo covering
-    everything) never actually gets exercised - this bypasses that so you
-    can confirm each source still works on its own.
+    a source that's fully redundant on a given day (e.g. TradingView
+    covering everything) never actually gets exercised - this bypasses
+    that so you can confirm each source still works on its own.
     """
+    resolve_watchlist()
     print(f"Testing {len(STOCK_SOURCES)} stock source(s) against {len(WATCHLIST)} ticker(s): {', '.join(WATCHLIST)}\n")
 
     for name, fetch_fn in STOCK_SOURCES:
