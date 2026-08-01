@@ -920,7 +920,7 @@ def weekly_trend_data():
 
 # --- Price sparklines ----------------------------------------------------------
 
-SPARKLINE_MAX_POINTS = 12
+SPARKLINE_MAX_POINTS = 8
 _SPARK_CHARS = "▁▂▃▄▅▆▇█"  # 8 levels, low to high
 
 
@@ -1127,6 +1127,28 @@ def _html_escape(s):
 def format_email_html(prices, indices, used_source, previous_prices):
     """Builds the HTML email body.
 
+    Layout: a stack of separate rounded-corner cards (header, market
+    indices, top movers, one card per exchange, weekly trend) with visible
+    gaps between them on the page background, rather than one continuous
+    card - a structural pattern borrowed from rework.com per explicit
+    request (colors/typography were deliberately left unchanged; only
+    spacing/cards/structure). Built as nested tables (an outer 600px table
+    whose rows each hold one independent card-table) since that's the
+    most reliably-supported way to get consistent gaps across email
+    clients - div margins are a real risk in Outlook, padding on table
+    cells isn't.
+
+    The first attempt at this used a bubblier, more "marketing page" look
+    (16px radius, drop shadows, generous 24px padding). After actually
+    finding real rework.com product screenshots (not just their marketing
+    site, which is JS-rendered and unreadable by a text fetch) - via the
+    Sales Operations and Projects feature pages' og:image assets and
+    third-party app-store/review-site listings - the corners were tightened
+    (10px cards, 8px nested tables), shadows dropped in favor of flat
+    bordered surfaces, and row padding tightened (10px -> 8px). Real
+    operations/data software in this genre reads as flatter and denser
+    than a marketing page, which is what these are meant to reflect.
+
     Collapsible sections via <details>/<summary> were tried here at one
     point (no JavaScript needed, since email clients strip scripts
     anyway) but confirmed non-functional in Gmail's web client - clicking
@@ -1134,23 +1156,31 @@ def format_email_html(prices, indices, used_source, previous_prices):
     triangle rendered. Reverted back to plain, non-interactive headers
     rather than leave dead "looks clickable but isn't" markup in place.
     """
-    parts = []
-    parts.append(f"""\
-<!DOCTYPE html>
-<html lang="vi">
-<head><meta charset="utf-8"></head>
-<body style="margin:0;padding:0;background:#f1f5f9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f1f5f9;padding:24px 0;">
-<tr><td align="center">
-<table role="presentation" width="600" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,0.08);">
+    CARD_RADIUS = "10px"
+    CARD_PADDING = "20px"
+    GAP = "12px"
 
-<tr><td style="background:{_NAVY};padding:24px 28px;">
-  <div style="color:#ffffff;font-size:20px;font-weight:700;">Danh Mục Cổ Phiếu Việt Nam</div>
-  <div style="color:#94a3b8;font-size:13px;margin-top:4px;">{format_vn_datetime(now_vn())} (Giờ Việt Nam)</div>
-</td></tr>
-""")
+    def _card(inner_html, bg="#ffffff", border=True, padding=CARD_PADDING):
+        border_style = f"border:1px solid {_BORDER};" if border else ""
+        return (
+            f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
+            f'style="background:{bg};border-radius:{CARD_RADIUS};{border_style}">'
+            f'<tr><td style="padding:{padding};">{inner_html}</td></tr></table>'
+        )
 
-    # --- Market indices ---
+    def _card_row(card_html, padding_bottom=GAP):
+        return f'<tr><td style="padding-bottom:{padding_bottom};">{card_html}</td></tr>'
+
+    cards = []  # each entry is a full <tr><td>...card...</td></tr> row
+
+    # --- Header card ---
+    header_inner = (
+        f'<div style="color:#ffffff;font-size:20px;font-weight:700;">Danh Mục Cổ Phiếu Việt Nam</div>'
+        f'<div style="color:#94a3b8;font-size:13px;margin-top:4px;">{format_vn_datetime(now_vn())} (Giờ Việt Nam)</div>'
+    )
+    cards.append(_card_row(_card(header_inner, bg=_NAVY, border=False, padding="24px 28px")))
+
+    # --- Market indices card ---
     all_index_labels = [label for _code, label in INDICES]
     if any(label in indices for label in all_index_labels):
         cells = []
@@ -1172,19 +1202,15 @@ def format_email_html(prices, indices, used_source, previous_prices):
   <div style="font-size:19px;font-weight:700;color:{_NAVY};margin-top:4px;">{vals['close']:,.2f}</div>
   <div style="font-size:13px;font-weight:600;color:{color};margin-top:2px;">{change_text}</div>
 </td>""")
-        # strip trailing border on last cell
         if cells:
             cells[-1] = cells[-1].replace(f"border-right:1px solid {_BORDER};", "")
-        parts.append(f"""\
-<tr><td style="padding:20px 28px 4px 28px;">
-  <div style="font-size:13px;font-weight:700;color:{_NAVY};text-transform:uppercase;letter-spacing:0.04em;margin-bottom:8px;">Chỉ Số Thị Trường</div>
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid {_BORDER};border-radius:8px;">
-    <tr>{''.join(cells)}</tr>
-  </table>
-</td></tr>
-""")
+        indices_inner = (
+            f'<div style="font-size:13px;font-weight:700;color:{_NAVY};text-transform:uppercase;letter-spacing:0.04em;margin-bottom:12px;">Chỉ Số Thị Trường</div>'
+            f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid {_BORDER};border-radius:8px;"><tr>{"".join(cells)}</tr></table>'
+        )
+        cards.append(_card_row(_card(indices_inner)))
 
-    # --- Top movers ---
+    # --- Top movers card ---
     gainers, losers = top_movers(prices)
     if gainers or losers:
         def _chip(ticker, pct):
@@ -1206,16 +1232,14 @@ def format_email_html(prices, indices, used_source, previous_prices):
                 f'<div><span style="font-size:12px;color:{_GRAY};font-weight:600;">GIẢM GIÁ&nbsp;</span>'
                 + "".join(_chip(t, p) for t, p in losers) + "</div>"
             )
-        parts.append(f"""\
-<tr><td style="padding:16px 28px 4px 28px;">
-  <div style="font-size:13px;font-weight:700;color:{_NAVY};text-transform:uppercase;letter-spacing:0.04em;margin-bottom:8px;">Biến Động Nổi Bật</div>
-  {''.join(rows)}
-</td></tr>
-""")
+        movers_inner = (
+            f'<div style="font-size:13px;font-weight:700;color:{_NAVY};text-transform:uppercase;letter-spacing:0.04em;margin-bottom:12px;">Biến Động Nổi Bật</div>'
+            f'{"".join(rows)}'
+        )
+        cards.append(_card_row(_card(movers_inner)))
 
-    # --- Price table, grouped by exchange ---
+    # --- One card per exchange ---
     histories = load_all_ticker_histories()
-    exchange_sections = []
     for exch, tickers in watchlist_by_exchange().items():
         row_html = []
         for i, ticker in enumerate(tickers):
@@ -1224,8 +1248,8 @@ def format_email_html(prices, indices, used_source, previous_prices):
             if not vals:
                 row_html.append(f"""\
 <tr style="background:{stripe};">
-  <td style="padding:10px 12px;font-weight:700;color:{_NAVY};">{_html_escape(ticker)}</td>
-  <td colspan="5" style="padding:10px 12px;color:{_GRAY};font-size:13px;">không có dữ liệu lần này</td>
+  <td style="padding:8px 12px;font-weight:700;color:{_NAVY};">{_html_escape(ticker)}</td>
+  <td colspan="5" style="padding:8px 12px;color:{_GRAY};font-size:13px;">không có dữ liệu lần này</td>
 </tr>""")
                 continue
             pct = _pct_change(vals)
@@ -1234,44 +1258,40 @@ def format_email_html(prices, indices, used_source, previous_prices):
             spark = sparkline_text(closes)
             if spark:
                 spark_color = _GREEN if closes[-1] >= closes[0] else _RED
-                spark_html = f'<span style="color:{spark_color};font-size:14px;letter-spacing:1px;">{spark}</span>'
+                spark_html = f'<span style="color:{spark_color};font-size:18px;font-weight:600;line-height:1;">{spark}</span>'
             else:
-                spark_html = f'<span style="color:{_GRAY};">\u2013</span>'
+                spark_html = f'<span style="color:{_GRAY};font-size:18px;">\u2013</span>'
             row_html.append(f"""\
 <tr style="background:{stripe};">
-  <td style="padding:10px 12px;font-weight:700;color:{_NAVY};">{_html_escape(ticker)}</td>
-  <td style="padding:10px 12px;text-align:right;font-variant-numeric:tabular-nums;color:{_NAVY};">{vals['close']:,.0f}</td>
-  <td style="padding:10px 12px;text-align:center;">{_change_badge(pct)}</td>
-  <td style="padding:10px 12px;text-align:right;color:{_GRAY};font-size:13px;font-variant-numeric:tabular-nums;">{vals.get('volume', 0):,.0f}</td>
-  <td style="padding:10px 12px;text-align:right;color:{_GRAY};font-size:11px;">{_html_escape(source)}</td>
-  <td style="padding:10px 12px;text-align:center;white-space:nowrap;">{spark_html}</td>
+  <td style="padding:8px 12px;font-weight:700;color:{_NAVY};">{_html_escape(ticker)}</td>
+  <td style="padding:8px 12px;text-align:right;font-variant-numeric:tabular-nums;color:{_NAVY};">{vals['close']:,.0f}</td>
+  <td style="padding:8px 12px;text-align:center;">{_change_badge(pct)}</td>
+  <td style="padding:8px 12px;text-align:right;color:{_GRAY};font-size:13px;font-variant-numeric:tabular-nums;">{vals.get('volume', 0):,.0f}</td>
+  <td style="padding:8px 12px;text-align:right;color:{_GRAY};font-size:11px;">{_html_escape(source)}</td>
+  <td style="padding:8px 12px;text-align:center;">{spark_html}</td>
 </tr>""")
 
-        exchange_sections.append(f"""\
-  <div style="margin:16px 0 8px 0;">
-    <span style="display:inline-block;padding:2px 9px;border-radius:5px;background:{_NAVY};color:#ffffff;font-size:11px;font-weight:700;letter-spacing:0.04em;">{exch}</span>
-    <span style="font-size:12px;color:{_GRAY};margin-left:6px;">{len(tickers)} mã</span>
-  </div>
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid {_BORDER};border-radius:8px;overflow:hidden;font-size:14px;">
-    <tr style="background:#f8fafc;">
-      <th align="left" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Mã CK</th>
-      <th align="right" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Giá đóng cửa (VNĐ)</th>
-      <th align="center" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Thay đổi</th>
-      <th align="right" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Khối lượng</th>
-      <th align="right" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Nguồn</th>
-      <th align="center" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Xu Hướng</th>
-    </tr>
-    {''.join(row_html)}
-  </table>""")
+        exchange_table = f"""\
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid {_BORDER};border-radius:8px;overflow:hidden;font-size:14px;">
+  <tr style="background:#f8fafc;">
+    <th width="10%" align="left" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Mã CK</th>
+    <th width="17%" align="right" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Giá đóng cửa (VNĐ)</th>
+    <th width="15%" align="center" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Thay đổi</th>
+    <th width="15%" align="right" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Khối lượng</th>
+    <th width="13%" align="right" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Nguồn</th>
+    <th width="30%" align="center" style="padding:8px 12px;font-size:11px;color:{_GRAY};text-transform:uppercase;letter-spacing:0.04em;">Xu Hướng</th>
+  </tr>
+  {''.join(row_html)}
+</table>"""
+        exchange_inner = (
+            f'<div style="margin-bottom:12px;">'
+            f'<span style="display:inline-block;padding:2px 9px;border-radius:5px;background:{_NAVY};color:#ffffff;font-size:11px;font-weight:700;letter-spacing:0.04em;">{exch}</span>'
+            f'<span style="font-size:12px;color:{_GRAY};margin-left:6px;">{len(tickers)} mã</span>'
+            f'</div>{exchange_table}'
+        )
+        cards.append(_card_row(_card(exchange_inner)))
 
-    parts.append(f"""\
-<tr><td style="padding:20px 28px 4px 28px;">
-  <div style="font-size:13px;font-weight:700;color:{_NAVY};text-transform:uppercase;letter-spacing:0.04em;">Giá Đóng Cửa</div>
-  {''.join(exchange_sections)}
-</td></tr>
-""")
-
-    # --- Weekly trend ---
+    # --- Weekly trend card ---
     trend = weekly_trend_data()
     if trend:
         trend_rows = []
@@ -1282,34 +1302,41 @@ def format_email_html(prices, indices, used_source, previous_prices):
                 f'<span style="font-weight:700;color:{_NAVY};display:inline-block;width:56px;">{_html_escape(ticker)}</span>'
                 f'<span style="color:{color};font-weight:600;">{arrow} {pct:+.2f}% trong tuần qua</span></div>'
             )
-        parts.append(f"""\
-<tr><td style="padding:20px 28px 4px 28px;">
-  <div style="font-size:13px;font-weight:700;color:{_NAVY};text-transform:uppercase;letter-spacing:0.04em;margin-bottom:8px;">Xu Hướng Tuần (Thay Đổi 7 Ngày)</div>
-  {''.join(trend_rows)}
-</td></tr>
-""")
+        trend_inner = (
+            f'<div style="font-size:13px;font-weight:700;color:{_NAVY};text-transform:uppercase;letter-spacing:0.04em;margin-bottom:12px;">Xu Hướng Tuần (Thay Đổi 7 Ngày)</div>'
+            f'{"".join(trend_rows)}'
+        )
+        cards.append(_card_row(_card(trend_inner)))
 
-    # --- Footer ---
+    # --- Footer (plain text on the page background, not its own card) ---
     sources_used = sorted(set(used_source.values()))
     sources_line = f"Nguồn dữ liệu lần này: {_html_escape(', '.join(sources_used))}" if sources_used else ""
-    parts.append(f"""\
-<tr><td style="padding:20px 28px 28px 28px;">
-  <div style="border-top:1px solid {_BORDER};padding-top:14px;font-size:11px;color:#9ca3af;line-height:1.5;">
+    footer_html = f"""\
+<tr><td style="padding:8px 12px 0 12px;">
+  <div style="font-size:11px;color:#9ca3af;line-height:1.5;">
     {sources_line}<br>
     Đây là các nguồn dữ liệu công khai từ ứng dụng của từng nhà cung cấp, không phải API
     chính thức/được đảm bảo. Vui lòng kiểm tra lại với công ty chứng khoán của bạn trước
     khi giao dịch dựa trên các số liệu này.
   </div>
-</td></tr>
+</td></tr>"""
 
+    return f"""\
+<!DOCTYPE html>
+<html lang="vi">
+<head><meta charset="utf-8"></head>
+<body style="margin:0;padding:0;background:#f1f5f9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f1f5f9;padding:24px 0;">
+<tr><td align="center">
+<table role="presentation" width="600" cellpadding="0" cellspacing="0">
+{''.join(cards)}
+{footer_html}
 </table>
 </td></tr>
 </table>
 </body>
 </html>
-""")
-
-    return "".join(parts)
+"""
 
 
 # --- Email --------------------------------------------------------------------
